@@ -1,0 +1,16 @@
+# Binaries
+/glx
+*.exe
+*.test
+
+# Build/scratch
+/tmp/
+/dist/
+
+# Go coverage
+*.out
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/
