@@ -25,6 +25,7 @@ type Discussion struct {
 type MRDetail struct {
 	IID               string
 	Title             string
+	Draft             bool   // work-in-progress
 	State             string // opened / merged / closed
 	MergeStatus       string // CAN_BE_MERGED, etc. (coarse mergeStatusEnum)
 	DetailedStatus    string // detailedMergeStatus, e.g. MERGEABLE, NEED_REBASE
@@ -38,6 +39,7 @@ type MRDetail struct {
 	PipelineLabel     string
 	PipelineID        int // head pipeline numeric ID, 0 if none
 	Approved          bool
+	ApprovedByMe      bool // the authenticated user is among the approvers
 	ApprovalsRequired int
 	ApprovalsLeft     int
 	ApprovedBy        []string
@@ -57,7 +59,7 @@ func (c *Client) MergeRequestDetail(ctx context.Context, projectPath, iid string
 	const query = `query($path: ID!, $iid: String!) {
   project(fullPath: $path) {
     mergeRequest(iid: $iid) {
-      iid title state mergeStatusEnum detailedMergeStatus shouldBeRebased description webUrl
+      iid title draft state mergeStatusEnum detailedMergeStatus shouldBeRebased description webUrl
       sourceBranch targetBranch
       approved approvalsLeft approvalsRequired
       author { username }
@@ -80,6 +82,7 @@ func (c *Client) MergeRequestDetail(ctx context.Context, projectPath, iid string
 			MergeRequest *struct {
 				IID                 string `json:"iid"`
 				Title               string `json:"title"`
+				Draft               bool   `json:"draft"`
 				State               string `json:"state"`
 				MergeStatusEnum     string `json:"mergeStatusEnum"`
 				DetailedMergeStatus string `json:"detailedMergeStatus"`
@@ -138,6 +141,7 @@ func (c *Client) MergeRequestDetail(ctx context.Context, projectPath, iid string
 	d := &MRDetail{
 		IID:               mr.IID,
 		Title:             mr.Title,
+		Draft:             mr.Draft,
 		State:             mr.State,
 		MergeStatus:       mr.MergeStatusEnum,
 		DetailedStatus:    mr.DetailedMergeStatus,
@@ -158,6 +162,9 @@ func (c *Client) MergeRequestDetail(ctx context.Context, projectPath, iid string
 	}
 	for _, n := range mr.ApprovedBy.Nodes {
 		d.ApprovedBy = append(d.ApprovedBy, n.Username)
+		if c.username != "" && n.Username == c.username {
+			d.ApprovedByMe = true
+		}
 	}
 	for _, disc := range mr.Discussions.Nodes {
 		dd := Discussion{ID: disc.ID, Resolvable: disc.Resolvable, Resolved: disc.Resolved}

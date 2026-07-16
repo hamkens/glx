@@ -152,6 +152,24 @@ func (m detailModel) rebaseCmd() tea.Cmd {
 	}
 }
 
+func (m detailModel) setDraftCmd(draft bool) tea.Cmd {
+	client, path, iid := m.client, m.projectPath, m.iid
+	title := ""
+	if m.detail != nil {
+		title = m.detail.Title
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		err := client.SetDraft(ctx, path, iid, title, draft)
+		verb := "marked ready"
+		if draft {
+			verb = "marked as draft"
+		}
+		return actionDoneMsg{verb: verb, err: err}
+	}
+}
+
 func (m detailModel) Update(msg tea.Msg) (detailModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -281,6 +299,17 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 			m.flash = "rebasing…"
 			return m, m.rebaseCmd()
 		}
+	case "D":
+		// Toggle draft / ready.
+		if m.detail != nil && m.detail.State == "opened" {
+			draft := !m.detail.Draft
+			if draft {
+				m.flash = "marking as draft…"
+			} else {
+				m.flash = "marking ready…"
+			}
+			return m, m.setDraftCmd(draft)
+		}
 	case "c":
 		m.mode = modeComment
 		m.textarea.Focus()
@@ -395,6 +424,9 @@ func (m detailModel) header(d *gitlab.MRDetail) string {
 	meta := fmt.Sprintf("%s  %s  %s", stateStyled, branches, author)
 
 	approvals := fmt.Sprintf("approvals: %d/%d", d.ApprovalsRequired-d.ApprovalsLeft, d.ApprovalsRequired)
+	if d.ApprovedByMe && d.ApprovalsLeft > 0 {
+		approvals = lipgloss.NewStyle().Foreground(colorGreen).Render("✓ approved by you") + helpStyle.Render(fmt.Sprintf(" · %s, no action needed", approvals))
+	}
 	if len(d.ApprovedBy) > 0 {
 		approvals += helpStyle.Render(" (" + strings.Join(prefixAt(d.ApprovedBy), ", ") + ")")
 	}
@@ -425,10 +457,14 @@ func (m detailModel) footer() string {
 		return errStyle.Render("  set auto-merge (merge when pipeline succeeds)? [y/N]")
 	}
 	approveLabel := "a approve"
-	if m.detail != nil && m.detail.Approved {
+	if m.detail != nil && (m.detail.Approved || m.detail.ApprovedByMe) {
 		approveLabel = "a unapprove"
 	}
-	return helpStyle.Render(fmt.Sprintf("  %s · d diff · p pipeline · M merge · A auto-merge · b rebase · c comment · ? help", approveLabel))
+	draftLabel := "D draft"
+	if m.detail != nil && m.detail.Draft {
+		draftLabel = "D ready"
+	}
+	return helpStyle.Render(fmt.Sprintf("  %s · %s · d diff · p pipeline · M merge · A auto-merge · b rebase · c comment · ? help", approveLabel, draftLabel))
 }
 
 // helpers --------------------------------------------------------------------
@@ -496,6 +532,13 @@ func autoMergeBlockedReason(d *gitlab.MRDetail) string {
 // mergeStatusLabel renders the MR's mergeability as a colored label, using the
 // detailed status when available so "needs rebase" is distinct from mergeable.
 func mergeStatusLabel(d *gitlab.MRDetail) string {
+	// Terminal states aren't merge blockers — render them in their own color.
+	switch d.State {
+	case "merged":
+		return lipgloss.NewStyle().Foreground(colorGreen).Render("✓ merged")
+	case "closed":
+		return helpStyle.Render("✕ closed")
+	}
 	if reason := mergeBlockedReason(d); reason != "" {
 		return errStyle.Render("⚠ " + reason)
 	}

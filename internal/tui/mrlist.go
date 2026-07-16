@@ -191,7 +191,7 @@ func (m mrListModel) approveActionCmd(mr gitlab.MR) tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		verb, err := "approved", error(nil)
-		if mr.Approved {
+		if mr.ApprovedByMe {
 			verb, err = "unapproved", client.Unapprove(ctx, mr.ProjectPath, mr.IID)
 		} else {
 			err = client.Approve(ctx, mr.ProjectPath, mr.IID)
@@ -221,6 +221,20 @@ func (m mrListModel) rebaseActionCmd(mr gitlab.MR) tea.Cmd {
 		defer cancel()
 		err := client.Rebase(ctx, mr.ProjectPath, mr.IID)
 		return actionDoneMsg{verb: "rebase started", err: err}
+	}
+}
+
+func (m mrListModel) setDraftActionCmd(mr gitlab.MR, draft bool) tea.Cmd {
+	client := m.client
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		err := client.SetDraft(ctx, mr.ProjectPath, mr.IID, mr.Title, draft)
+		verb := "marked ready"
+		if draft {
+			verb = "marked as draft"
+		}
+		return actionDoneMsg{verb: verb, err: err}
 	}
 }
 
@@ -549,6 +563,16 @@ func (m mrListModel) handleKey(msg tea.KeyMsg) (mrListModel, tea.Cmd) {
 		if mr, ok := m.selected(); ok && mr.MergedAt == "" {
 			m.flash = "rebasing…"
 			return m, m.rebaseActionCmd(mr)
+		}
+	case "D":
+		if mr, ok := m.selected(); ok && mr.MergedAt == "" {
+			draft := !mr.Draft
+			if draft {
+				m.flash = "marking as draft…"
+			} else {
+				m.flash = "marking ready…"
+			}
+			return m, m.setDraftActionCmd(mr, draft)
 		}
 	}
 
