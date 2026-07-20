@@ -41,6 +41,7 @@ type MR struct {
 	Pipeline       string // GraphQL pipeline status, or "" if none
 	Approved       bool   // fully approved (requirements met)
 	ApprovedByMe   bool   // the authenticated user is among the approvers
+	ReviewState    string // authenticated user's state: REQUESTED, REVIEWED, APPROVED
 	ApprovalsLeft  int
 	DetailedStatus string // detailedMergeStatus, e.g. MERGEABLE, NEED_REBASE
 	PipelineID     int    // head pipeline numeric ID, 0 if none
@@ -72,6 +73,7 @@ const mrFields = `
   project { fullPath }
   author { username }
   approvedBy { nodes { username } }
+  reviewers { nodes { username mergeRequestInteraction { reviewState } } }
   headPipeline { id status }
 `
 
@@ -198,6 +200,14 @@ type mrNode struct {
 			Username string `json:"username"`
 		} `json:"nodes"`
 	} `json:"approvedBy"`
+	Reviewers struct {
+		Nodes []struct {
+			Username                string `json:"username"`
+			MergeRequestInteraction struct {
+				ReviewState string `json:"reviewState"`
+			} `json:"mergeRequestInteraction"`
+		} `json:"nodes"`
+	} `json:"reviewers"`
 	HeadPipeline *struct {
 		ID     string `json:"id"`
 		Status string `json:"status"`
@@ -220,6 +230,13 @@ func (conn mrConnection) toPage(me string) *MRPage {
 				break
 			}
 		}
+		reviewState := ""
+		for _, reviewer := range n.Reviewers.Nodes {
+			if me != "" && reviewer.Username == me {
+				reviewState = reviewer.MergeRequestInteraction.ReviewState
+				break
+			}
+		}
 		mr := MR{
 			IID:            n.IID,
 			Title:          n.Title,
@@ -232,6 +249,7 @@ func (conn mrConnection) toPage(me string) *MRPage {
 			Author:         n.Author.Username,
 			Approved:       n.Approved,
 			ApprovedByMe:   approvedByMe,
+			ReviewState:    reviewState,
 			ApprovalsLeft:  n.ApprovalsLeft,
 			DetailedStatus: n.DetailedMergeStatus,
 			UpdatedAt:      n.UpdatedAt,

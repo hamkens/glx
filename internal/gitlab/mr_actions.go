@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	gogitlab "github.com/xanzy/go-gitlab"
 )
@@ -82,6 +83,49 @@ func (c *Client) Merge(ctx context.Context, projectPath, iid string, mergeWhenPi
 		return fmt.Errorf("merge request is not in a mergeable state (pipeline, approvals, conflicts, or draft)")
 	}
 	return err
+}
+
+// SetDraft marks the MR as a draft (draft=true) or ready (draft=false).
+// GitLab derives draft state from a "Draft:" title prefix, so this rewrites the
+// title accordingly. currentTitle is the MR's present title.
+func (c *Client) SetDraft(ctx context.Context, projectPath, iid, currentTitle string, draft bool) error {
+	n, err := iidInt(iid)
+	if err != nil {
+		return err
+	}
+	newTitle := applyDraftPrefix(currentTitle, draft)
+	if newTitle == currentTitle {
+		return nil // already in the desired state
+	}
+	opts := &gogitlab.UpdateMergeRequestOptions{Title: gogitlab.Ptr(newTitle)}
+	_, _, err = c.rest.MergeRequests.UpdateMergeRequest(projectPath, n, opts, gogitlab.WithContext(ctx))
+	if err == nil {
+		c.invalidateMR(projectPath, iid)
+	}
+	return err
+}
+
+// applyDraftPrefix adds or removes GitLab's "Draft:" title prefix. It also
+// strips the legacy "WIP:" prefix. Matching is case-insensitive.
+func applyDraftPrefix(title string, draft bool) string {
+	stripped := title
+	for {
+		trimmed := strings.TrimSpace(stripped)
+		low := strings.ToLower(trimmed)
+		switch {
+		case strings.HasPrefix(low, "draft:"):
+			stripped = strings.TrimSpace(trimmed[len("draft:"):])
+		case strings.HasPrefix(low, "wip:"):
+			stripped = strings.TrimSpace(trimmed[len("wip:"):])
+		default:
+			goto done
+		}
+	}
+done:
+	if draft {
+		return "Draft: " + stripped
+	}
+	return stripped
 }
 
 // Rebase asks GitLab to rebase the MR's source branch onto its target. The

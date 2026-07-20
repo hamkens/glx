@@ -54,7 +54,30 @@ type mergedLoadedMsg struct {
 	scope gitlab.Scope
 	mrs   []gitlab.MR
 }
+
+// scopeSummaryLoadedMsg carries the complete open workload for a scope. It is
+// separate from mrsLoadedMsg so the list itself can remain paginated.
+type scopeSummaryLoadedMsg struct {
+	scope gitlab.Scope
+	mrs   []gitlab.MR
+}
 type mrsErrMsg struct{ err error }
+
+type scopeSummary struct {
+	pending int
+	stale   int
+	oldest  time.Duration
+
+	ready     int
+	blocked   int
+	drafts    int
+	approvals int
+	ciFailed  int
+	ciRunning int
+	conflicts int
+	rebases   int
+	threads   int
+}
 
 // --- model ---
 
@@ -81,6 +104,7 @@ type mrListModel struct {
 	width       int
 	height      int
 	lastSynced  string
+	summaries   map[gitlab.Scope]scopeSummary
 }
 
 func newMRListModel(client *gitlab.Client) mrListModel {
@@ -91,7 +115,10 @@ func newMRListModel(client *gitlab.Client) mrListModel {
 	ti.Prompt = "/"
 	ti.Placeholder = "filter by title, project, or branch"
 
-	return mrListModel{client: client, spinner: sp, filterInput: ti, loading: true}
+	return mrListModel{
+		client: client, spinner: sp, filterInput: ti, loading: true,
+		summaries: make(map[gitlab.Scope]scopeSummary),
+	}
 }
 
 func (m mrListModel) scope() gitlab.Scope { return scopeOrder[m.scopeIdx].scope }
@@ -180,7 +207,42 @@ func (m mrListModel) loadMoreCmd() tea.Cmd {
 }
 
 func (m mrListModel) Init() tea.Cmd {
-	return tea.Batch(m.spinner.Tick, m.fetchCmd(false))
+	return tea.Batch(
+		m.spinner.Tick,
+		m.fetchCmd(false),
+		m.summaryCmd(gitlab.ScopeReviewer, false),
+		m.summaryCmd(gitlab.ScopeAuthored, false),
+	)
+}
+
+// summaryCmd walks every page so tab badges describe the whole workload rather
+// than only the pages the user has visited.
+func (m mrListModel) summaryCmd(scope gitlab.Scope, force bool) tea.Cmd {
+	client := m.client
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if force {
+			ctx = gitlab.WithForceRefresh(ctx)
+		}
+
+		all := make([]gitlab.MR, 0)
+		cursor := ""
+		for {
+			page, err := client.MergeRequests(ctx, scope, cursor, 100)
+			if err != nil {
+				// Summary metadata is supplementary; the main list request owns
+				// user-visible errors.
+				return scopeSummaryLoadedMsg{scope: scope}
+			}
+			all = append(all, page.MRs...)
+			if !page.HasNextPage {
+				break
+			}
+			cursor = page.EndCursor
+		}
+		return scopeSummaryLoadedMsg{scope: scope, mrs: all}
+	}
 }
 
 // --- action commands (operate on the selected MR) ---
@@ -191,7 +253,7 @@ func (m mrListModel) approveActionCmd(mr gitlab.MR) tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		verb, err := "approved", error(nil)
-		if mr.Approved {
+		if mr.ApprovedByMe {
 			verb, err = "unapproved", client.Unapprove(ctx, mr.ProjectPath, mr.IID)
 		} else {
 			err = client.Approve(ctx, mr.ProjectPath, mr.IID)
@@ -221,6 +283,20 @@ func (m mrListModel) rebaseActionCmd(mr gitlab.MR) tea.Cmd {
 		defer cancel()
 		err := client.Rebase(ctx, mr.ProjectPath, mr.IID)
 		return actionDoneMsg{verb: "rebase started", err: err}
+	}
+}
+
+func (m mrListModel) setDraftActionCmd(mr gitlab.MR, draft bool) tea.Cmd {
+	client := m.client
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		err := client.SetDraft(ctx, mr.ProjectPath, mr.IID, mr.Title, draft)
+		verb := "marked ready"
+		if draft {
+			verb = "marked as draft"
+		}
+		return actionDoneMsg{verb: verb, err: err}
 	}
 }
 
@@ -434,6 +510,14 @@ func (m mrListModel) Update(msg tea.Msg) (mrListModel, tea.Cmd) {
 		m.rebuildRows()
 		return m, nil
 
+	case scopeSummaryLoadedMsg:
+		// A nil slice means the supplementary request failed; retain any older
+		// summary instead of making a transient API error look like zero work.
+		if msg.mrs != nil {
+			m.summaries[msg.scope] = summarizeScope(msg.scope, msg.mrs, time.Now())
+		}
+		return m, nil
+
 	case actionDoneMsg:
 		if msg.err != nil {
 			m.flash = errStyle.Render("✘ " + msg.verb + " failed: " + msg.err.Error())
@@ -441,7 +525,7 @@ func (m mrListModel) Update(msg tea.Msg) (mrListModel, tea.Cmd) {
 		}
 		m.flash = lipgloss.NewStyle().Foreground(colorGreen).Render("✓ " + msg.verb)
 		// Refresh to reflect the new state (caches were invalidated server-side).
-		return m, tea.Batch(m.spinner.Tick, m.fetchCmd(true))
+		return m, tea.Batch(m.spinner.Tick, m.fetchCmd(true), m.summaryCmd(m.scope(), true))
 
 	case mrsErrMsg:
 		m.loading = false
@@ -515,7 +599,7 @@ func (m mrListModel) handleKey(msg tea.KeyMsg) (mrListModel, tea.Cmd) {
 		return m, tea.Batch(m.spinner.Tick, m.fetchCmd(false))
 	case "r":
 		m.resetPaging()
-		return m, tea.Batch(m.spinner.Tick, m.fetchCmd(true))
+		return m, tea.Batch(m.spinner.Tick, m.fetchCmd(true), m.summaryCmd(m.scope(), true))
 	case "/":
 		m.filterMode = true
 		m.filterInput.Focus()
@@ -549,6 +633,16 @@ func (m mrListModel) handleKey(msg tea.KeyMsg) (mrListModel, tea.Cmd) {
 		if mr, ok := m.selected(); ok && mr.MergedAt == "" {
 			m.flash = "rebasing…"
 			return m, m.rebaseActionCmd(mr)
+		}
+	case "D":
+		if mr, ok := m.selected(); ok && mr.MergedAt == "" {
+			draft := !mr.Draft
+			if draft {
+				m.flash = "marking as draft…"
+			} else {
+				m.flash = "marking ready…"
+			}
+			return m, m.setDraftActionCmd(mr, draft)
 		}
 	}
 
@@ -736,33 +830,153 @@ func relAge(ts string) string {
 
 func (m mrListModel) statusBar() string {
 	tabs := make([]string, len(scopeOrder))
-	for i, s := range scopeOrder {
+	for i, scope := range scopeOrder {
+		label := scope.label
+		if summary, ok := m.summaries[scope.scope]; ok {
+			switch scope.scope {
+			case gitlab.ScopeReviewer:
+				label += fmt.Sprintf(" %d", summary.pending)
+			case gitlab.ScopeAuthored:
+				label += fmt.Sprintf(" %d ready", summary.ready)
+			}
+		}
 		if i == m.scopeIdx {
-			tabs[i] = titleStyle.Render(s.label)
+			tabs[i] = titleStyle.Render(label)
 		} else {
-			tabs[i] = helpStyle.Render(s.label)
+			tabs[i] = helpStyle.Render(label)
 		}
 	}
 	left := strings.Join(tabs, helpStyle.Render(" · "))
 	if m.loadingMore {
 		left += "  " + helpStyle.Render(m.spinner.View()+" more")
 	}
+
 	right := helpStyle.Render(m.client.Host())
-	if cnt := len(m.visibleMRs()); cnt > 0 {
-		more := ""
-		if m.hasNext {
-			more = "+"
-		}
-		right += helpStyle.Render(fmt.Sprintf("  %d%s", cnt, more))
+	if detail := m.scopeSummaryDetail(); detail != "" {
+		right += helpStyle.Render("  " + detail)
 	}
 	if m.lastSynced != "" {
 		right += helpStyle.Render("  synced " + m.lastSynced)
+	}
+	maxRight := m.width - lipgloss.Width(left) - 3
+	if maxRight > 0 {
+		right = truncateToWidth(right, maxRight)
+	} else {
+		right = ""
 	}
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 2
 	if gap < 1 {
 		gap = 1
 	}
 	return statusBarStyle.Width(m.width).Render(left + strings.Repeat(" ", gap) + right)
+}
+
+const staleReviewAge = 48 * time.Hour
+
+func summarizeScope(scope gitlab.Scope, mrs []gitlab.MR, now time.Time) scopeSummary {
+	var summary scopeSummary
+	for _, mr := range mrs {
+		switch scope {
+		case gitlab.ScopeReviewer:
+			if mr.Draft || mr.ReviewState != "REQUESTED" {
+				continue
+			}
+			summary.pending++
+			updated, err := time.Parse(time.RFC3339, mr.UpdatedAt)
+			if err != nil {
+				continue
+			}
+			age := now.Sub(updated)
+			if age >= staleReviewAge {
+				summary.stale++
+			}
+			if age > summary.oldest {
+				summary.oldest = age
+			}
+
+		case gitlab.ScopeAuthored:
+			if readyToMerge(mr) {
+				summary.ready++
+				continue
+			}
+			summary.blocked++
+			if mr.Draft {
+				summary.drafts++
+			}
+			if mr.ApprovalsLeft > 0 || mr.DetailedStatus == "NOT_APPROVED" {
+				summary.approvals++
+			}
+			if mr.Pipeline == "FAILED" {
+				summary.ciFailed++
+			}
+			if mr.Pipeline == "RUNNING" || mr.Pipeline == "PENDING" || mr.DetailedStatus == "CI_STILL_RUNNING" {
+				summary.ciRunning++
+			}
+			if mr.Conflicts || mr.DetailedStatus == "CONFLICT" {
+				summary.conflicts++
+			}
+			if mr.DetailedStatus == "NEED_REBASE" {
+				summary.rebases++
+			}
+			if mr.DetailedStatus == "DISCUSSIONS_NOT_RESOLVED" {
+				summary.threads++
+			}
+		}
+	}
+	return summary
+}
+
+func readyToMerge(mr gitlab.MR) bool {
+	return mr.DetailedStatus == "MERGEABLE" && listMergeBlock(mr) == ""
+}
+
+func (m mrListModel) scopeSummaryDetail() string {
+	summary, ok := m.summaries[m.scope()]
+	if !ok {
+		return ""
+	}
+
+	var parts []string
+	switch m.scope() {
+	case gitlab.ScopeReviewer:
+		parts = appendCount(parts, summary.stale, "stale", "stale")
+		if summary.pending > 0 && summary.oldest > 0 {
+			parts = append(parts, "oldest "+shortAge(summary.oldest))
+		}
+	case gitlab.ScopeAuthored:
+		parts = appendCount(parts, summary.approvals, "approval", "approvals")
+		parts = appendCount(parts, summary.ciFailed, "CI failed", "CI failed")
+		parts = appendCount(parts, summary.rebases, "rebase", "rebases")
+		parts = appendCount(parts, summary.conflicts, "conflict", "conflicts")
+		parts = appendCount(parts, summary.threads, "thread", "threads")
+		parts = appendCount(parts, summary.ciRunning, "CI running", "CI running")
+		parts = appendCount(parts, summary.drafts, "draft", "drafts")
+		if len(parts) == 0 && summary.blocked > 0 {
+			parts = append(parts, fmt.Sprintf("%d blocked", summary.blocked))
+		}
+	}
+	return strings.Join(parts, " · ")
+}
+
+func appendCount(parts []string, count int, singular, plural string) []string {
+	if count == 0 {
+		return parts
+	}
+	label := plural
+	if count == 1 {
+		label = singular
+	}
+	return append(parts, fmt.Sprintf("%d %s", count, label))
+}
+
+func shortAge(d time.Duration) string {
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	}
+	return fmt.Sprintf("%dd", int(d.Hours()/24))
 }
 
 // bottomLine shows the filter input, a confirm prompt, a flash, or help hints.

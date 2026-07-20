@@ -40,17 +40,18 @@ const (
 // rootModel routes between views. enter opens the detail view for the
 // selected MR; d opens the diff; esc/backspace steps back one level.
 type rootModel struct {
-	client    *gitlab.Client
-	view      view
-	prevView  view // view to return to from the watch screen
-	mrList    mrListModel
-	detail    detailModel
-	diff      diffModel
-	pipeline  pipelineModel
-	jobLog    jobLogModel
-	watchView watchModel
-	showHelp  bool
-	notice    string // transient root-level status line (e.g. browser result)
+	client      *gitlab.Client
+	view        view
+	watchReturn view // view to return to when leaving the watch screen
+	pipeReturn  view // view to return to when leaving the pipeline screen
+	mrList      mrListModel
+	detail      detailModel
+	diff        diffModel
+	pipeline    pipelineModel
+	jobLog      jobLogModel
+	watchView   watchModel
+	showHelp    bool
+	notice      string // transient root-level status line (e.g. browser result)
 
 	watch    *watch.Registry
 	watching bool // a background watch tick is scheduled
@@ -339,7 +340,7 @@ func (m rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "W":
 				// Open the watch list view.
 				if m.view != viewWatch {
-					m.prevView = m.view
+					m.watchReturn = m.view
 					m.watchView = newWatchModel(m.client, m.watch)
 					m.view = viewWatch
 					var szCmd tea.Cmd
@@ -372,12 +373,12 @@ func (m rootModel) updateWatch(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c":
 			return m, tea.Quit
 		case "esc", "backspace", "q":
-			m.view = m.prevView
+			m.view = m.watchReturn
 			return m, nil
 		case "enter":
 			// Open the selected watched pipeline in the full pipeline view.
 			if e, sel := m.watchView.selected(); sel {
-				m.prevView = viewWatch
+				m.pipeReturn = viewWatch
 				m.pipeline = newPipelineModel(m.client, e.ProjectPath, e.PipelineID, e.MRIID)
 				m.view = viewPipeline
 				var szCmd tea.Cmd
@@ -417,6 +418,7 @@ func (m rootModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "p":
 			if mr, ok := m.mrList.selected(); ok && mr.PipelineID > 0 {
+				m.pipeReturn = viewList
 				m.pipeline = newPipelineModel(m.client, mr.ProjectPath, mr.PipelineID, mr.IID)
 				m.view = viewPipeline
 				var szCmd tea.Cmd
@@ -460,6 +462,7 @@ func (m rootModel) updateDetail(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "p":
 			// Open the pipeline view, if this MR has a head pipeline.
 			if m.detail.mode == modeNone && m.detail.detail != nil && m.detail.detail.PipelineID > 0 {
+				m.pipeReturn = viewDetail
 				m.pipeline = newPipelineModel(m.client, m.detail.projectPath, m.detail.detail.PipelineID, m.detail.iid)
 				m.view = viewPipeline
 				var szCmd tea.Cmd
@@ -480,10 +483,10 @@ func (m rootModel) updatePipeline(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c":
 			return m, tea.Quit
 		case "esc", "backspace":
-			// Return to wherever we opened the pipeline from (watch list or
-			// MR detail).
-			if m.prevView == viewWatch {
-				m.view = viewWatch
+			// Return to whichever view opened the pipeline (list, detail, or
+			// watch). Default to detail if somehow unset.
+			if m.pipeReturn == viewList || m.pipeReturn == viewWatch {
+				m.view = m.pipeReturn
 			} else {
 				m.view = viewDetail
 			}
