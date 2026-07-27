@@ -52,7 +52,7 @@ func helpSections(v view) []struct {
 		}{
 			{"Merge request", []keyHelp{
 				{"a", "approve / unapprove"},
-				{"M", "merge now (confirm y/N)"},
+				{"M", "merge / add to merge train (confirm y/N)"},
 				{"A", "auto-merge when pipeline passes"},
 				{"b", "rebase onto target"},
 				{"D", "toggle draft / ready"},
@@ -126,7 +126,7 @@ func helpSections(v view) []struct {
 			}},
 			{"Actions on selected MR", []keyHelp{
 				{"a", "approve / unapprove"},
-				{"M", "merge now (confirm y/N)"},
+				{"M", "merge / add to merge train (confirm y/N)"},
 				{"A", "auto-merge when pipeline passes"},
 				{"b", "rebase onto target"},
 				{"D", "toggle draft / ready"},
