@@ -267,9 +267,12 @@ func (m mrListModel) mergeActionCmd(mr gitlab.MR, auto bool) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		err := client.Merge(ctx, mr.ProjectPath, mr.IID, auto)
+		outcome, err := client.Merge(ctx, mr.ProjectPath, mr.IID, auto)
 		verb := "merged"
-		if auto {
+		switch outcome {
+		case gitlab.MergeOutcomeTrain:
+			verb = "added to merge train"
+		case gitlab.MergeOutcomeAutoMerge:
 			verb = "auto-merge set"
 		}
 		return actionDoneMsg{verb: verb, err: err}
@@ -577,7 +580,7 @@ func (m mrListModel) handleKey(msg tea.KeyMsg) (mrListModel, tea.Cmd) {
 			if auto {
 				m.flash = "setting auto-merge…"
 			} else {
-				m.flash = "merging…"
+				m.flash = "submitting merge…"
 			}
 			return m, m.mergeActionCmd(mr, auto)
 		}

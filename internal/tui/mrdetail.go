@@ -121,9 +121,12 @@ func (m detailModel) mergeCmd(auto bool) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		err := client.Merge(ctx, path, iid, auto)
+		outcome, err := client.Merge(ctx, path, iid, auto)
 		verb := "merged"
-		if auto {
+		switch outcome {
+		case gitlab.MergeOutcomeTrain:
+			verb = "added to merge train"
+		case gitlab.MergeOutcomeAutoMerge:
 			verb = "auto-merge set"
 		}
 		return actionDoneMsg{verb: verb, err: err}
@@ -252,7 +255,7 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 			if auto {
 				m.flash = "setting auto-merge…"
 			} else {
-				m.flash = "merging…"
+				m.flash = "submitting merge…"
 			}
 			return m, m.mergeCmd(auto)
 		default:
