@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	gogitlab "github.com/xanzy/go-gitlab"
+
+	"github.com/hamkens/glx/internal/forge"
 )
 
 func TestMergeRoutesThroughMergeTrainWhenEnabled(t *testing.T) {
@@ -39,8 +41,8 @@ func TestMergeRoutesThroughMergeTrainWhenEnabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Merge() error = %v", err)
 	}
-	if outcome != MergeOutcomeTrain {
-		t.Fatalf("Merge() outcome = %v; want %v", outcome, MergeOutcomeTrain)
+	if outcome != forge.MergeOutcomeTrain {
+		t.Fatalf("Merge() outcome = %v; want %v", outcome, forge.MergeOutcomeTrain)
 	}
 	if requests != 2 {
 		t.Fatalf("request count = %d; want 2", requests)
@@ -67,8 +69,8 @@ func TestMergeUsesRegularEndpointWithoutMergeTrain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Merge() error = %v", err)
 	}
-	if outcome != MergeOutcomeMerged {
-		t.Fatalf("Merge() outcome = %v; want %v", outcome, MergeOutcomeMerged)
+	if outcome != forge.MergeOutcomeMerged {
+		t.Fatalf("Merge() outcome = %v; want %v", outcome, forge.MergeOutcomeMerged)
 	}
 }
 
@@ -98,8 +100,8 @@ func TestMergeTrainAutoMergeWaitsForChecks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Merge() error = %v", err)
 	}
-	if outcome != MergeOutcomeAutoMerge {
-		t.Fatalf("Merge() outcome = %v; want %v", outcome, MergeOutcomeAutoMerge)
+	if outcome != forge.MergeOutcomeAutoMerge {
+		t.Fatalf("Merge() outcome = %v; want %v", outcome, forge.MergeOutcomeAutoMerge)
 	}
 }
 

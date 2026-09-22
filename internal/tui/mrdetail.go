@@ -13,12 +13,12 @@ import (
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/hamkens/glx/internal/gitlab"
+	"github.com/hamkens/glx/internal/forge"
 )
 
 // --- messages ---
 
-type detailLoadedMsg struct{ detail *gitlab.MRDetail }
+type detailLoadedMsg struct{ detail *forge.ChangeDetail }
 type detailErrMsg struct{ err error }
 
 // actionDoneMsg reports the result of a write action (approve/merge/comment).
@@ -34,20 +34,22 @@ const (
 	modeNone             inputMode = iota
 	modeComment                    // composing a comment
 	modeConfirmMerge               // y/n merge confirmation
-	modeConfirmAutoMerge           // y/n auto-merge (merge when pipeline succeeds)
+	modeConfirmAutoMerge           // y/n auto-merge (merge once checks pass)
 )
 
-// detailModel renders one merge request and hosts write actions.
+// detailModel renders one change and hosts write actions.
 type detailModel struct {
-	client      *gitlab.Client
-	projectPath string
-	iid         string
+	client forge.Forge
+	vocab  forge.Vocabulary
+	caps   forge.Capabilities
+	repo   string
+	id     string
 
 	vp       viewport.Model
 	spinner  spinner.Model
 	textarea textarea.Model
 
-	detail  *gitlab.MRDetail
+	detail  *forge.ChangeDetail
 	loading bool
 	err     error
 	mode    inputMode
@@ -57,7 +59,7 @@ type detailModel struct {
 	height int
 }
 
-func newDetailModel(client *gitlab.Client, projectPath, iid string) detailModel {
+func newDetailModel(client forge.Forge, repo, id string) detailModel {
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 
@@ -66,24 +68,26 @@ func newDetailModel(client *gitlab.Client, projectPath, iid string) detailModel 
 	ta.ShowLineNumbers = false
 
 	return detailModel{
-		client:      client,
-		projectPath: projectPath,
-		iid:         iid,
-		spinner:     sp,
-		textarea:    ta,
-		loading:     true,
+		client:   client,
+		vocab:    vocabForRepo(client, repo),
+		caps:     capsForRepo(client, repo),
+		repo:     repo,
+		id:       id,
+		spinner:  sp,
+		textarea: ta,
+		loading:  true,
 	}
 }
 
 func (m detailModel) fetchCmd(force bool) tea.Cmd {
-	client, path, iid := m.client, m.projectPath, m.iid
+	client, repo, id := m.client, m.repo, m.id
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		if force {
-			ctx = gitlab.WithForceRefresh(ctx)
+			ctx = forge.WithForceRefresh(ctx)
 		}
-		d, err := client.MergeRequestDetail(ctx, path, iid)
+		d, err := client.ChangeDetail(ctx, repo, id)
 		if err != nil {
 			return detailErrMsg{err}
 		}
@@ -98,35 +102,35 @@ func (m detailModel) Init() tea.Cmd {
 // action command builders ---------------------------------------------------
 
 func (m detailModel) approveCmd(approve bool) tea.Cmd {
-	client, path, iid := m.client, m.projectPath, m.iid
+	client, repo, id, vocab := m.client, m.repo, m.id, m.vocab
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		var err error
 		verb := "approved"
 		if approve {
-			err = client.Approve(ctx, path, iid)
+			err = client.Approve(ctx, repo, id)
 		} else {
-			verb = "unapproved"
-			err = client.Unapprove(ctx, path, iid)
+			verb = vocab.Unapprove + "d"
+			err = client.Unapprove(ctx, repo, id)
 		}
 		return actionDoneMsg{verb: verb, err: err}
 	}
 }
 
-// mergeCmd merges now. When auto is true it sets merge-when-pipeline-succeeds
-// (GitLab "auto-merge"), so the merge happens once the pipeline passes.
+// mergeCmd merges now. When auto is true the provider is asked to merge once
+// its checks pass (GitLab auto-merge / GitHub auto-merge or merge queue).
 func (m detailModel) mergeCmd(auto bool) tea.Cmd {
-	client, path, iid := m.client, m.projectPath, m.iid
+	client, repo, id, vocab := m.client, m.repo, m.id, m.vocab
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		outcome, err := client.Merge(ctx, path, iid, auto)
+		outcome, err := client.Merge(ctx, repo, id, auto)
 		verb := "merged"
 		switch outcome {
-		case gitlab.MergeOutcomeTrain:
-			verb = "added to merge train"
-		case gitlab.MergeOutcomeAutoMerge:
+		case forge.MergeOutcomeTrain:
+			verb = "added to " + vocab.MergeQueue
+		case forge.MergeOutcomeAutoMerge:
 			verb = "auto-merge set"
 		}
 		return actionDoneMsg{verb: verb, err: err}
@@ -134,29 +138,31 @@ func (m detailModel) mergeCmd(auto bool) tea.Cmd {
 }
 
 func (m detailModel) commentCmd(body string) tea.Cmd {
-	client, path, iid := m.client, m.projectPath, m.iid
+	client, repo, id := m.client, m.repo, m.id
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		err := client.AddComment(ctx, path, iid, body)
+		err := client.AddComment(ctx, repo, id, body)
 		return actionDoneMsg{verb: "commented", err: err}
 	}
 }
 
-func (m detailModel) rebaseCmd() tea.Cmd {
-	client, path, iid := m.client, m.projectPath, m.iid
+// updateBranchCmd brings the source branch up to date with its target: a rebase
+// on GitLab, an update-branch merge on GitHub.
+func (m detailModel) updateBranchCmd() tea.Cmd {
+	client, repo, id, vocab := m.client, m.repo, m.id, m.vocab
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		err := client.Rebase(ctx, path, iid)
-		// The rebase is async server-side; the refetch (triggered on success)
-		// will reflect the new status once GitLab finishes.
-		return actionDoneMsg{verb: "rebase started", err: err}
+		err := client.UpdateBranch(ctx, repo, id)
+		// Both providers run this asynchronously; the refetch triggered on
+		// success reflects the new state once the server finishes.
+		return actionDoneMsg{verb: vocab.UpdateBranchDone, err: err}
 	}
 }
 
 func (m detailModel) setDraftCmd(draft bool) tea.Cmd {
-	client, path, iid := m.client, m.projectPath, m.iid
+	client, repo, id := m.client, m.repo, m.id
 	title := ""
 	if m.detail != nil {
 		title = m.detail.Title
@@ -164,7 +170,7 @@ func (m detailModel) setDraftCmd(draft bool) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		err := client.SetDraft(ctx, path, iid, title, draft)
+		err := client.SetDraft(ctx, repo, id, title, draft)
 		verb := "marked ready"
 		if draft {
 			verb = "marked as draft"
@@ -273,12 +279,16 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 	case "a":
 		if m.detail != nil {
 			approve := !m.detail.Approved
+			if !approve && !m.caps.Unapprove {
+				m.flash = errStyle.Render("✘ " + m.vocab.Unapprove + " is not supported here")
+				return m, nil
+			}
 			m.flash = "submitting approval…"
 			return m, m.approveCmd(approve)
 		}
 	case "M":
 		if m.detail != nil {
-			if reason := mergeBlockedReason(m.detail); reason != "" {
+			if reason := mergeBlockedReason(m.detail, m.vocab); reason != "" {
 				m.flash = errStyle.Render("✘ can't merge: " + reason)
 				return m, nil
 			}
@@ -286,11 +296,15 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 		}
 		return m, nil
 	case "A":
-		// Auto-merge: merge when the pipeline succeeds. Unlike a plain merge,
-		// a still-running pipeline is expected, so it isn't a blocker — but
-		// other gates (rebase, conflicts, approvals, draft) still are.
+		// Auto-merge: merge once the checks pass. Unlike a plain merge, CI still
+		// in flight is expected, so it isn't a blocker — but the other gates
+		// (behind target, conflicts, approvals, draft) still are.
 		if m.detail != nil {
-			if reason := autoMergeBlockedReason(m.detail); reason != "" {
+			if !m.caps.AutoMerge {
+				m.flash = errStyle.Render("✘ auto-merge is not supported here")
+				return m, nil
+			}
+			if reason := autoMergeBlockedReason(m.detail, m.vocab); reason != "" {
 				m.flash = errStyle.Render("✘ can't auto-merge: " + reason)
 				return m, nil
 			}
@@ -299,12 +313,16 @@ func (m detailModel) handleKey(msg tea.KeyMsg) (detailModel, tea.Cmd) {
 		return m, nil
 	case "b":
 		if m.detail != nil {
-			m.flash = "rebasing…"
-			return m, m.rebaseCmd()
+			m.flash = m.vocab.UpdateBranchGerund + "…"
+			return m, m.updateBranchCmd()
 		}
 	case "D":
 		// Toggle draft / ready.
-		if m.detail != nil && m.detail.State == "opened" {
+		if m.detail != nil && m.detail.State == forge.StateOpen {
+			if !m.caps.DraftToggle {
+				m.flash = errStyle.Render("✘ toggling draft is not supported here")
+				return m, nil
+			}
 			draft := !m.detail.Draft
 			if draft {
 				m.flash = "marking as draft…"
@@ -362,7 +380,8 @@ func (m *detailModel) renderBody() {
 
 	// Discussion threads.
 	threads := m.detail.Discussions
-	b.WriteString(titleStyle.Render(fmt.Sprintf("Threads (%d)", len(threads))) + "\n\n")
+	heading := strings.ToUpper(m.vocab.Threads[:1]) + m.vocab.Threads[1:]
+	b.WriteString(titleStyle.Render(fmt.Sprintf("%s (%d)", heading, len(threads))) + "\n\n")
 	for _, d := range threads {
 		for _, n := range d.Notes {
 			author := lipgloss.NewStyle().Bold(true).Render("@" + n.Author)
@@ -389,7 +408,7 @@ func (m *detailModel) renderBody() {
 
 func (m detailModel) View() string {
 	if m.loading && m.detail == nil {
-		return fmt.Sprintf("\n  %s loading merge request…", m.spinner.View())
+		return fmt.Sprintf("\n  %s loading %s…", m.spinner.View(), m.vocab.Change)
 	}
 	if m.err != nil {
 		return "\n  " + errStyle.Render("error: "+m.err.Error()) + "\n  " + helpStyle.Render("esc back")
@@ -413,12 +432,12 @@ func (m detailModel) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left, header, m.vp.View(), m.footer())
 }
 
-func (m detailModel) header(d *gitlab.MRDetail) string {
-	title := titleStyle.Render(fmt.Sprintf("!%s %s", d.IID, d.Title))
+func (m detailModel) header(d *forge.ChangeDetail) string {
+	title := titleStyle.Render(fmt.Sprintf("%s%s %s", m.vocab.IDPrefix, d.ID, d.Title))
 
-	state := strings.ToLower(d.State)
+	state := d.State.String()
 	stateStyled := lipgloss.NewStyle().Foreground(colorGreen).Render(state)
-	if state != "opened" {
+	if d.State != forge.StateOpen {
 		stateStyled = helpStyle.Render(state)
 	}
 
@@ -426,18 +445,8 @@ func (m detailModel) header(d *gitlab.MRDetail) string {
 	author := helpStyle.Render("by @" + d.Author)
 	meta := fmt.Sprintf("%s  %s  %s", stateStyled, branches, author)
 
-	approvals := fmt.Sprintf("approvals: %d/%d", d.ApprovalsRequired-d.ApprovalsLeft, d.ApprovalsRequired)
-	if d.ApprovedByMe && d.ApprovalsLeft > 0 {
-		approvals = lipgloss.NewStyle().Foreground(colorGreen).Render("✓ approved by you") + helpStyle.Render(fmt.Sprintf(" · %s, no action needed", approvals))
-	}
-	if len(d.ApprovedBy) > 0 {
-		approvals += helpStyle.Render(" (" + strings.Join(prefixAt(d.ApprovedBy), ", ") + ")")
-	}
-	pipe := "pipeline: " + pipelineGlyph(d.Pipeline)
-	if d.PipelineLabel != "" {
-		pipe += " " + helpStyle.Render(d.PipelineLabel)
-	}
-	line3 := fmt.Sprintf("%s   %s   %s", approvals, pipe, mergeStatusLabel(d))
+	line3 := fmt.Sprintf("%s   %s   %s", m.approvalSummary(d), m.pipelineSummary(d),
+		mergeStatusLabel(d, m.vocab))
 
 	rule := helpStyle.Render(strings.Repeat("─", max(m.width, 1)))
 
@@ -452,104 +461,138 @@ func (m detailModel) header(d *gitlab.MRDetail) string {
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
+// approvalSummary describes the approval state. GitHub reports no approval
+// count, so when the provider gives no required total this falls back to a plain
+// approved / review-required reading rather than showing a bogus "0/0".
+func (m detailModel) approvalSummary(d *forge.ChangeDetail) string {
+	var summary string
+	switch {
+	case d.ApprovalsRequired > 0:
+		summary = fmt.Sprintf("approvals: %d/%d",
+			d.ApprovalsRequired-d.ApprovalsLeft, d.ApprovalsRequired)
+	case d.ApprovalsLeft > 0:
+		summary = "approvals: review required"
+	case d.Approved:
+		summary = "approvals: satisfied"
+	default:
+		summary = "approvals: none required"
+	}
+	if d.ApprovedByMe && d.ApprovalsLeft > 0 {
+		summary = lipgloss.NewStyle().Foreground(colorGreen).Render("✓ approved by you") +
+			helpStyle.Render(fmt.Sprintf(" · %s, no action needed", summary))
+	}
+	if len(d.ApprovedBy) > 0 {
+		summary += helpStyle.Render(" (" + strings.Join(prefixAt(d.ApprovedBy), ", ") + ")")
+	}
+	return summary
+}
+
+func (m detailModel) pipelineSummary(d *forge.ChangeDetail) string {
+	pipe := m.vocab.Pipeline + ": " + statusGlyph(d.Pipeline)
+	if d.PipelineLabel != "" {
+		pipe += " " + helpStyle.Render(d.PipelineLabel)
+	}
+	return pipe
+}
+
 func (m detailModel) footer() string {
 	if m.mode == modeConfirmMerge {
-		return errStyle.Render("  merge this MR now? [y/N]")
+		return errStyle.Render("  merge this " + m.vocab.ChangeAbbrev + " now? [y/N]")
 	}
 	if m.mode == modeConfirmAutoMerge {
-		return errStyle.Render("  set auto-merge (merge when pipeline succeeds)? [y/N]")
+		return errStyle.Render("  set auto-merge (merge when checks pass)? [y/N]")
 	}
-	approveLabel := "a approve"
+	approveLabel := "a " + m.vocab.Approve
 	if m.detail != nil && (m.detail.Approved || m.detail.ApprovedByMe) {
-		approveLabel = "a unapprove"
+		approveLabel = "a " + m.vocab.Unapprove
 	}
 	draftLabel := "D draft"
 	if m.detail != nil && m.detail.Draft {
 		draftLabel = "D ready"
 	}
-	return helpStyle.Render(fmt.Sprintf("  %s · %s · d diff · p pipeline · M merge · A auto-merge · b rebase · c comment · ? help", approveLabel, draftLabel))
+	return helpStyle.Render(fmt.Sprintf(
+		"  %s · %s · d diff · p %s · M merge · A auto-merge · b %s · c comment · ? help",
+		approveLabel, draftLabel, m.vocab.Pipeline, m.vocab.UpdateBranch))
 }
 
 // helpers --------------------------------------------------------------------
 
-// mergeBlockedReason returns a human-readable reason the MR cannot be merged
-// right now, or "" if it appears mergeable. It keys off detailedMergeStatus,
-// which (unlike the coarse mergeStatusEnum) distinguishes states like
-// NEED_REBASE. This avoids firing a merge GitLab would reject with an opaque
-// "405 Method Not Allowed".
-func mergeBlockedReason(d *gitlab.MRDetail) string {
-	if d.State != "opened" {
-		return "merge request is " + strings.ToLower(d.State)
+// mergeBlockedReason returns a human-readable reason the change cannot be
+// merged right now, or "" if it appears mergeable. It reads the normalized
+// MergeState rather than either provider's raw status, which is what keeps glx
+// from firing a merge the server would reject with an opaque 405.
+func mergeBlockedReason(d *forge.ChangeDetail, v forge.Vocabulary) string {
+	if d.State != forge.StateOpen {
+		return v.Change + " is " + d.State.String()
 	}
-	// Prefer the detailed status; fall back to the coarse one if absent.
-	switch d.DetailedStatus {
-	case "MERGEABLE", "":
-		// fall through to coarse checks below
-	case "NEED_REBASE":
-		return "needs rebase onto target branch (press b to rebase)"
-	case "BROKEN_STATUS", "CONFLICT":
+	switch d.MergeState {
+	case forge.MergeStateMergeable, forge.MergeStateUnknown:
+		// No known blocker; fall through to the approval check below.
+	case forge.MergeStateChecking:
+		return "mergeability is still being checked"
+	case forge.MergeStateNeedsUpdate:
+		return fmt.Sprintf("is behind its target branch (press b to %s)", v.UpdateBranch)
+	case forge.MergeStateConflict:
 		return "has conflicts that must be resolved"
-	case "CI_STILL_RUNNING":
-		return "pipeline must finish first"
-	case "CI_MUST_PASS":
-		return "pipeline must pass first"
-	case "DRAFT_STATUS":
-		return "merge request is still a draft"
-	case "DISCUSSIONS_NOT_RESOLVED":
-		return "open threads must be resolved"
-	case "NOT_APPROVED":
+	case forge.MergeStateCIRunning:
+		return v.Pipeline + " must finish first"
+	case forge.MergeStateCIFailed:
+		return v.Pipeline + " must pass first"
+	case forge.MergeStateDraft:
+		return v.Change + " is still a draft"
+	case forge.MergeStateThreadsUnresolved:
+		return "open " + v.Threads + " must be resolved"
+	case forge.MergeStateNotApproved:
 		return "required approvals are missing"
-	case "BLOCKED_STATUS":
-		return "blocked by another merge request"
+	case forge.MergeStateChangesRequested:
+		return "a reviewer requested changes"
+	case forge.MergeStateBlocked:
+		return "blocked by a branch rule or another " + v.Change
 	default:
-		return humanizeStatus(d.DetailedStatus)
+		return d.MergeState.String()
 	}
 
 	if d.ApprovalsLeft > 0 {
 		return fmt.Sprintf("%d more approval(s) required", d.ApprovalsLeft)
 	}
-	if d.MergeStatus != "CAN_BE_MERGED" && d.MergeStatus != "MERGEABLE" && d.MergeStatus != "" {
-		return humanizeStatus(d.MergeStatus)
+	// GitLab can report MERGEABLE while the branch is still behind its target.
+	if d.NeedsUpdate {
+		return fmt.Sprintf("is behind its target branch (press b to %s)", v.UpdateBranch)
 	}
 	return ""
 }
 
-// autoMergeBlockedReason is like mergeBlockedReason but tolerates a running
-// pipeline, since auto-merge exists precisely to merge once it passes.
-func autoMergeBlockedReason(d *gitlab.MRDetail) string {
-	switch d.DetailedStatus {
-	case "CI_STILL_RUNNING", "CI_MUST_PASS", "MERGEABLE":
-		// A pending/running pipeline is fine for auto-merge; check other gates.
-		if d.State != "opened" {
-			return "merge request is " + strings.ToLower(d.State)
-		}
-		if d.ShouldBeRebased {
-			return "needs rebase onto target branch (press b to rebase)"
-		}
-		return ""
-	default:
-		return mergeBlockedReason(d)
+// autoMergeBlockedReason is like mergeBlockedReason but tolerates CI still in
+// flight, since auto-merge exists precisely to merge once it passes.
+func autoMergeBlockedReason(d *forge.ChangeDetail, v forge.Vocabulary) string {
+	if !d.MergeState.CIPending() && !d.MergeState.Mergeable() {
+		return mergeBlockedReason(d, v)
 	}
+	if d.State != forge.StateOpen {
+		return v.Change + " is " + d.State.String()
+	}
+	if d.Draft {
+		return v.Change + " is still a draft"
+	}
+	if d.NeedsUpdate {
+		return fmt.Sprintf("is behind its target branch (press b to %s)", v.UpdateBranch)
+	}
+	return ""
 }
 
-// mergeStatusLabel renders the MR's mergeability as a colored label, using the
-// detailed status when available so "needs rebase" is distinct from mergeable.
-func mergeStatusLabel(d *gitlab.MRDetail) string {
+// mergeStatusLabel renders mergeability as a colored label.
+func mergeStatusLabel(d *forge.ChangeDetail, v forge.Vocabulary) string {
 	// Terminal states aren't merge blockers — render them in their own color.
 	switch d.State {
-	case "merged":
+	case forge.StateMerged:
 		return lipgloss.NewStyle().Foreground(colorGreen).Render("✓ merged")
-	case "closed":
+	case forge.StateClosed:
 		return helpStyle.Render("✕ closed")
 	}
-	if reason := mergeBlockedReason(d); reason != "" {
+	if reason := mergeBlockedReason(d, v); reason != "" {
 		return errStyle.Render("⚠ " + reason)
 	}
 	return lipgloss.NewStyle().Foreground(colorGreen).Render("✓ mergeable")
-}
-
-func humanizeStatus(s string) string {
-	return strings.ToLower(strings.ReplaceAll(s, "_", " "))
 }
 
 func prefixAt(names []string) []string {

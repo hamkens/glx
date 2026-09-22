@@ -11,12 +11,12 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/hamkens/glx/internal/gitlab"
+	"github.com/hamkens/glx/internal/forge"
 )
 
 // --- messages ---
 
-type diffLoadedMsg struct{ diff *gitlab.MRDiff }
+type diffLoadedMsg struct{ diff *forge.Diff }
 type diffErrMsg struct{ err error }
 
 // diffMode is the diff view's transient input state.
@@ -27,17 +27,17 @@ const (
 	diffModeComment
 )
 
-// diffModel renders the changed files of an MR with a file list, a
+// diffModel renders the changed files of a change with a file list, a
 // syntax-highlighted diff pane, a line cursor, and inline commenting.
 type diffModel struct {
-	client      *gitlab.Client
-	projectPath string
-	iid         string
+	client forge.Forge
+	repo   string
+	id     string
 
 	spinner  spinner.Model
 	textarea textarea.Model
 
-	diff      *gitlab.MRDiff
+	diff      *forge.Diff
 	fileIdx   int        // selected file
 	lines     []diffLine // parsed lines of the selected file
 	lineCur   int        // cursor within lines (for commenting)
@@ -52,7 +52,7 @@ type diffModel struct {
 	height int
 }
 
-func newDiffModel(client *gitlab.Client, projectPath, iid string) diffModel {
+func newDiffModel(client forge.Forge, repo, id string) diffModel {
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 
@@ -61,24 +61,24 @@ func newDiffModel(client *gitlab.Client, projectPath, iid string) diffModel {
 	ta.ShowLineNumbers = false
 
 	return diffModel{
-		client:      client,
-		projectPath: projectPath,
-		iid:         iid,
-		spinner:     sp,
-		textarea:    ta,
-		loading:     true,
+		client:   client,
+		repo:     repo,
+		id:       id,
+		spinner:  sp,
+		textarea: ta,
+		loading:  true,
 	}
 }
 
 func (m diffModel) fetchCmd(force bool) tea.Cmd {
-	client, path, iid := m.client, m.projectPath, m.iid
+	client, repo, id := m.client, m.repo, m.id
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		defer cancel()
 		if force {
-			ctx = gitlab.WithForceRefresh(ctx)
+			ctx = forge.WithForceRefresh(ctx)
 		}
-		d, err := client.MergeRequestDiff(ctx, path, iid)
+		d, err := client.ChangeDiff(ctx, repo, id)
 		if err != nil {
 			return diffErrMsg{err}
 		}
@@ -92,14 +92,14 @@ func (m diffModel) Init() tea.Cmd {
 
 // postCommentCmd posts a positioned inline comment for the line at idx.
 func (m diffModel) postCommentCmd(idx int, body string) tea.Cmd {
-	client, path, iid := m.client, m.projectPath, m.iid
+	client, repo, id := m.client, m.repo, m.id
 	f := m.diff.Files[m.fileIdx]
 	refs := m.diff.Refs
 	ln := m.lines[idx]
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		dc := gitlab.DiffComment{
+		dc := forge.DiffComment{
 			Refs:    refs,
 			NewPath: f.NewPath,
 			OldPath: f.OldPath,
@@ -112,7 +112,7 @@ func (m diffModel) postCommentCmd(idx int, body string) tea.Cmd {
 		default:
 			dc.NewLine = ln.newLine
 		}
-		err := client.AddDiffComment(ctx, path, iid, dc)
+		err := client.AddDiffComment(ctx, repo, id, dc)
 		return actionDoneMsg{verb: "commented", err: err}
 	}
 }

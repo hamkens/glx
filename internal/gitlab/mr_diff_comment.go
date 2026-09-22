@@ -4,28 +4,14 @@ import (
 	"context"
 
 	gogitlab "github.com/xanzy/go-gitlab"
-)
 
-// DiffComment describes where to anchor an inline comment on a merge request
-// diff. Exactly one of NewLine / OldLine is typically set:
-//   - NewLine for an added or context line (right side of the diff)
-//   - OldLine for a removed line (left side of the diff)
-//
-// NewPath/OldPath are the file paths from the FileDiff (usually identical
-// unless the file was renamed).
-type DiffComment struct {
-	Refs    DiffRefs
-	NewPath string
-	OldPath string
-	NewLine int // 0 = unset
-	OldLine int // 0 = unset
-	Body    string
-}
+	"github.com/hamkens/glx/internal/forge"
+)
 
 // AddDiffComment posts a positioned inline comment as a new discussion on the
 // MR diff. This is the fiddly part of the GitLab API: the Position payload must
 // carry all three diff SHAs plus the file path and the line on the correct side.
-func (c *Client) AddDiffComment(ctx context.Context, projectPath, iid string, dc DiffComment) error {
+func (c *Client) AddDiffComment(ctx context.Context, projectPath, iid string, dc forge.DiffComment) error {
 	n, err := iidInt(iid)
 	if err != nil {
 		return err

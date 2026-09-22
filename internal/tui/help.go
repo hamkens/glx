@@ -4,6 +4,8 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/hamkens/glx/internal/forge"
 )
 
 // keyHelp is a single key/description pair shown in the help overlay.
@@ -12,63 +14,79 @@ type keyHelp struct {
 	desc string
 }
 
-// helpSections returns the keybinding groups for a given view.
-func helpSections(v view) []struct {
+// helpSection is one titled group of keybindings.
+type helpSection struct {
 	title string
 	keys  []keyHelp
-} {
+}
+
+// changeActionKeys are the write actions available on a selected change, shared
+// by the list and detail views. Wording and availability follow the provider:
+// unsupported actions are omitted rather than listed and then rejected.
+func changeActionKeys(v forge.Vocabulary, caps forge.Capabilities) []keyHelp {
+	approve := v.Approve
+	if caps.Unapprove {
+		approve += " / " + v.Unapprove
+	}
+	keys := []keyHelp{
+		{"a", approve},
+		{"M", "merge / add to " + v.MergeQueue + " (confirm y/N)"},
+	}
+	if caps.AutoMerge {
+		keys = append(keys, keyHelp{"A", "auto-merge when the " + v.Pipeline + " passes"})
+	}
+	keys = append(keys, keyHelp{"b", v.UpdateBranch + " onto target"})
+	if caps.DraftToggle {
+		keys = append(keys, keyHelp{"D", "toggle draft / ready"})
+	}
+	return keys
+}
+
+// helpSections returns the keybinding groups for a given view.
+func helpSections(v view, vocab forge.Vocabulary, caps forge.Capabilities) []helpSection {
 	global := []keyHelp{
 		{"?", "toggle this help"},
 		{"o", "open current item in browser"},
-		{"w", "watch/unwatch this pipeline"},
+		{"w", "watch/unwatch this " + vocab.Pipeline},
 		{"W", "open watch list"},
 		{"q / ctrl+c / ctrl+d", "quit"},
 		{"r", "refresh (bypass cache)"},
 	}
 
+	// Title-cased provider nouns for section headings.
+	changeTitle := title(vocab.Change)
+	pipelineTitle := title(vocab.Pipeline)
+
 	switch v {
 	case viewWatch:
-		return []struct {
-			title string
-			keys  []keyHelp
-		}{
-			{"Watched pipelines", []keyHelp{
+		return []helpSection{
+			{"Watched " + vocab.Pipeline + "s", []keyHelp{
 				{"↑/↓", "move"},
-				{"enter", "open pipeline"},
+				{"enter", "open " + vocab.Pipeline},
 				{"w / x", "unwatch selected"},
 				{"r", "refresh all now"},
 				{"esc / ⌫", "back"},
 			}},
 			{"Background", []keyHelp{
-				{"(auto)", "active pipelines polled every 15s"},
+				{"(auto)", "active " + vocab.Pipeline + "s polled every 15s"},
 				{"(alert)", "changes shown bottom-right + bell"},
 			}},
 			{"Global", global},
 		}
 	case viewDetail:
-		return []struct {
-			title string
-			keys  []keyHelp
-		}{
-			{"Merge request", []keyHelp{
-				{"a", "approve / unapprove"},
-				{"M", "merge / add to merge train (confirm y/N)"},
-				{"A", "auto-merge when pipeline passes"},
-				{"b", "rebase onto target"},
-				{"D", "toggle draft / ready"},
-				{"c", "comment"},
-				{"d", "open diff"},
-				{"p", "open pipeline"},
-				{"↑/↓", "scroll"},
-				{"esc / ⌫", "back to list"},
-			}},
+		keys := append(changeActionKeys(vocab, caps),
+			keyHelp{"c", "comment"},
+			keyHelp{"d", "open diff"},
+			keyHelp{"p", "open " + vocab.Pipeline},
+			keyHelp{"↑/↓", "scroll"},
+			keyHelp{"esc / ⌫", "back to list"},
+		)
+		return []helpSection{
+			{changeTitle, keys},
 			{"Global", global},
 		}
 	case viewDiff:
-		return []struct {
-			title string
-			keys  []keyHelp
-		}{
+		return []helpSection{
 			{"Diff", []keyHelp{
 				{"←/→", "previous / next file"},
 				{"↑/↓ or j/k", "move line cursor"},
@@ -82,63 +100,56 @@ func helpSections(v view) []struct {
 			{"Global", global},
 		}
 	case viewPipeline:
-		return []struct {
-			title string
-			keys  []keyHelp
-		}{
-			{"Pipeline", []keyHelp{
+		cancel := "cancel job"
+		if caps.CancelJobIsRunWide {
+			cancel = "cancel the whole " + vocab.Pipeline + " (no per-job cancel)"
+		}
+		return []helpSection{
+			{pipelineTitle, []keyHelp{
 				{"↑/↓ or j/k", "move between jobs"},
 				{"enter", "view job log"},
 				{"R", "retry job"},
-				{"x", "cancel job"},
+				{"x", cancel},
 				{"r", "refresh now"},
 				{"esc / ⌫", "back to detail"},
 			}},
-			{"Pipeline — auto", []keyHelp{
+			{pipelineTitle + " — auto", []keyHelp{
 				{"(auto)", "refreshes every 15s while running"},
 				{"(alert)", "status changes shown bottom-right"},
 			}},
 			{"Global", global},
 		}
 	case viewJobLog:
-		return []struct {
-			title string
-			keys  []keyHelp
-		}{
+		return []helpSection{
 			{"Job log", []keyHelp{
 				{"↑/↓", "scroll"},
 				{"g / G", "top / bottom"},
 				{"t", "toggle tail"},
-				{"esc / ⌫", "back to pipeline"},
+				{"esc / ⌫", "back to " + vocab.Pipeline},
 			}},
 			{"Global", global},
 		}
 	default: // list
-		return []struct {
-			title string
-			keys  []keyHelp
-		}{
-			{"Merge request list", []keyHelp{
-				{"enter", "open merge request"},
+		return []helpSection{
+			{changeTitle + " list", []keyHelp{
+				{"enter", "open " + vocab.Change},
 				{"←/→ or tab", "switch scope"},
 				{"/", "filter"},
 				{"↑/↓", "move (auto-loads more)"},
+				{"pgup / pgdown", "half-page in Reviews / Authored"},
 			}},
-			{"Actions on selected MR", []keyHelp{
-				{"a", "approve / unapprove"},
-				{"M", "merge / add to merge train (confirm y/N)"},
-				{"A", "auto-merge when pipeline passes"},
-				{"b", "rebase onto target"},
-				{"D", "toggle draft / ready"},
-				{"d", "open diff"},
-				{"p", "open pipeline"},
-			}},
-			{"Legend — pipeline (1st glyph)", []keyHelp{
-				{pipelineGlyph("SUCCESS"), "passed"},
-				{pipelineGlyph("FAILED"), "failed"},
-				{pipelineGlyph("RUNNING"), "running / pending"},
-				{pipelineGlyph("CANCELED"), "canceled / skipped / manual"},
-				{pipelineGlyph(""), "no pipeline"},
+			{"Actions on selected " + vocab.ChangeAbbrev, append(changeActionKeys(vocab, caps),
+				keyHelp{"d", "open diff"},
+				keyHelp{"p", "open " + vocab.Pipeline},
+			)},
+			{"Legend — " + vocab.Pipeline + " (1st glyph)", []keyHelp{
+				{statusGlyph(forge.StatusSuccess), "passed"},
+				{statusGlyph(forge.StatusFailed), "failed"},
+				{statusGlyph(forge.StatusRunning), "running"},
+				{statusGlyph(forge.StatusPending), "pending"},
+				{statusGlyph(forge.StatusCanceled), "canceled / skipped"},
+				{statusGlyph(forge.StatusManual), "manual (waiting on a human)"},
+				{statusGlyph(forge.StatusNone), "no " + vocab.Pipeline},
 			}},
 			{"Legend — approvals (2nd glyph)", []keyHelp{
 				{approvalGlyph(true, true, 0), "approved by me"},
@@ -149,9 +160,10 @@ func helpSections(v view) []struct {
 			{"Legend — flags", []keyHelp{
 				{lipgloss.NewStyle().Foreground(colorSubtle).Render("draft"), "work in progress"},
 				{errStyle.Render("conflict"), "merge conflicts"},
-				{mergeStatusTag("NEED_REBASE"), "needs rebase onto target"},
-				{mergeStatusTag("BLOCKED_STATUS"), "blocked by another MR"},
-				{mergeStatusTag("DISCUSSIONS_NOT_RESOLVED"), "unresolved discussions"},
+				{mergeStateTag(forge.MergeStateNeedsUpdate, vocab), "behind its target branch"},
+				{mergeStateTag(forge.MergeStateBlocked, vocab), "blocked by a rule or another " + vocab.ChangeAbbrev},
+				{mergeStateTag(forge.MergeStateThreadsUnresolved, vocab), "unresolved " + vocab.Threads},
+				{mergeStateTag(forge.MergeStateChangesRequested, vocab), "a reviewer requested changes"},
 			}},
 			{"Global", global},
 		}
@@ -159,14 +171,14 @@ func helpSections(v view) []struct {
 }
 
 // renderHelpOverlay produces a centered help panel for the active view.
-func renderHelpOverlay(v view, width, height int) string {
+func renderHelpOverlay(v view, vocab forge.Vocabulary, caps forge.Capabilities, width, height int) string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("glx — keybindings"))
 	b.WriteString("\n\n")
 
 	keyStyle := lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
 
-	for _, sec := range helpSections(v) {
+	for _, sec := range helpSections(v, vocab, caps) {
 		b.WriteString(lipgloss.NewStyle().Bold(true).Render(sec.title))
 		b.WriteString("\n")
 		for _, k := range sec.keys {
@@ -194,6 +206,14 @@ func renderHelpOverlay(v view, width, height int) string {
 		return box
 	}
 	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// title upper-cases the first rune of a vocabulary noun for use as a heading.
+func title(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 // padDisplay right-pads s to n display columns, ignoring ANSI escape codes so

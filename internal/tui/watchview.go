@@ -8,7 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/hamkens/glx/internal/gitlab"
+	"github.com/hamkens/glx/internal/forge"
 	"github.com/hamkens/glx/internal/watch"
 )
 
@@ -19,7 +19,8 @@ type watchRefreshedMsg struct{}
 // registry (updated by the root's background poller); this view reads it and
 // offers manual refresh + unwatch.
 type watchModel struct {
-	client *gitlab.Client
+	client forge.Forge
+	vocab  forge.Vocabulary
 	reg    *watch.Registry
 
 	entries []watch.Entry
@@ -30,8 +31,8 @@ type watchModel struct {
 	height int
 }
 
-func newWatchModel(client *gitlab.Client, reg *watch.Registry) watchModel {
-	m := watchModel{client: client, reg: reg}
+func newWatchModel(client forge.Forge, reg *watch.Registry) watchModel {
+	m := watchModel{client: client, vocab: forge.Vocab(client.Provider()), reg: reg}
 	m.entries = reg.List()
 	return m
 }
@@ -61,10 +62,10 @@ func (m watchModel) refreshCmd() tea.Cmd {
 	return func() tea.Msg {
 		for _, e := range entries {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			p, err := client.PipelineWithJobs(gitlab.WithForceRefresh(ctx), e.ProjectPath, e.PipelineID)
+			p, err := client.PipelineWithJobs(forge.WithForceRefresh(ctx), e.Repo, e.PipelineID)
 			cancel()
 			if err == nil && p != nil {
-				reg.Update(e.ProjectPath, p)
+				reg.Update(e.Repo, p)
 			}
 		}
 		return watchRefreshedMsg{}
@@ -99,7 +100,7 @@ func (m watchModel) Update(msg tea.Msg) (watchModel, tea.Cmd) {
 			// Unwatch the selected entry (w is handled globally; x is a
 			// view-local convenience that doesn't conflict).
 			if e, ok := m.selected(); ok {
-				m.reg.Remove(e.ProjectPath, e.PipelineID)
+				m.reg.Remove(e.Repo, e.PipelineID)
 				m.reload()
 			}
 		}
@@ -126,12 +127,12 @@ func (m watchModel) listHeight() int {
 }
 
 func (m watchModel) View() string {
-	header := titleStyle.Render(fmt.Sprintf("Watched pipelines (%d)", len(m.entries)))
-	sub := helpStyle.Render("auto-refreshes active pipelines every 15s in the background")
+	header := titleStyle.Render(fmt.Sprintf("Watched %s (%d)", m.vocab.Pipeline+"s", len(m.entries)))
+	sub := helpStyle.Render("auto-refreshes active " + m.vocab.Pipeline + "s every 15s in the background")
 
 	var body string
 	if len(m.entries) == 0 {
-		body = "\n  " + helpStyle.Render("nothing watched — press w on a pipeline to start") + "\n"
+		body = "\n  " + helpStyle.Render("nothing watched — press w on a "+m.vocab.Pipeline+" to start") + "\n"
 	} else {
 		body = m.rows()
 	}
@@ -161,20 +162,20 @@ func (m watchModel) renderEntry(i int) string {
 	if i == m.cur {
 		cursor = lipgloss.NewStyle().Foreground(colorAccent).Render("▌ ")
 	}
-	status := e.Status
-	if status == "" {
+	status := e.Status.String()
+	if !e.Fetched() {
 		status = "…"
 	}
-	glyph := jobGlyph(e.Status)
+	glyph := statusGlyph(e.Status)
 	live := ""
 	if e.Active() {
 		live = helpStyle.Render(" ·live")
 	}
 	id := lipgloss.NewStyle().Foreground(colorSubtle).Render(fmt.Sprintf("#%d", e.PipelineID))
-	proj := shortProject(e.ProjectPath)
+	proj := shortProject(e.Repo)
 	mr := ""
-	if e.MRIID != "" {
-		mr = helpStyle.Render("  !" + e.MRIID)
+	if e.ChangeID != "" {
+		mr = helpStyle.Render("  " + m.vocab.IDPrefix + e.ChangeID)
 	}
 	line := fmt.Sprintf("%s%s %-9s %s  %s%s%s",
 		cursor, glyph, status, id, proj, mr, live)

@@ -8,17 +8,8 @@ import (
 	"strings"
 
 	gogitlab "github.com/xanzy/go-gitlab"
-)
 
-// MergeOutcome describes what GitLab did with a successful merge request.
-// Projects with merge trains queue an otherwise-ready MR instead of merging
-// it directly.
-type MergeOutcome int
-
-const (
-	MergeOutcomeMerged MergeOutcome = iota
-	MergeOutcomeTrain
-	MergeOutcomeAutoMerge
+	"github.com/hamkens/glx/internal/forge"
 )
 
 // These write actions use the REST backend, where the endpoints are stable and
@@ -40,7 +31,7 @@ func (c *Client) invalidateMR(projectPath, iid string) {
 	c.mrDetailCache.Invalidate(key)
 	c.mrDiffCache.Invalidate(key)
 	// MR list rows (approval/pipeline glyphs) may also change; clear all scopes.
-	for _, s := range []Scope{ScopeAssigned, ScopeReviewer, ScopeAuthored} {
+	for _, s := range []forge.Scope{forge.ScopeAssigned, forge.ScopeReviewer, forge.ScopeAuthored} {
 		c.mrListCache.Invalidate(string(s))
 	}
 }
@@ -74,20 +65,20 @@ func (c *Client) Unapprove(ctx context.Context, projectPath, iid string) error {
 // Merge merges the MR, or adds it to the project's merge train when merge
 // trains are enabled. When checks are still running, autoMerge asks GitLab to
 // enqueue or merge it once those checks pass.
-func (c *Client) Merge(ctx context.Context, projectPath, iid string, autoMerge bool) (MergeOutcome, error) {
+func (c *Client) Merge(ctx context.Context, projectPath, iid string, autoMerge bool) (forge.MergeOutcome, error) {
 	n, err := iidInt(iid)
 	if err != nil {
-		return MergeOutcomeMerged, err
+		return forge.MergeOutcomeMerged, err
 	}
 
 	project, _, err := c.rest.Projects.GetProject(projectPath, nil, gogitlab.WithContext(ctx))
 	if err != nil {
-		return MergeOutcomeMerged, fmt.Errorf("check project merge settings: %w", err)
+		return forge.MergeOutcomeMerged, fmt.Errorf("check project merge settings: %w", err)
 	}
 	if project.MergeTrainsEnabled {
-		outcome := MergeOutcomeTrain
+		outcome := forge.MergeOutcomeTrain
 		if autoMerge {
-			outcome = MergeOutcomeAutoMerge
+			outcome = forge.MergeOutcomeAutoMerge
 		}
 		if err := c.addToMergeTrain(ctx, projectPath, n, autoMerge); err != nil {
 			return outcome, err
@@ -97,10 +88,10 @@ func (c *Client) Merge(ctx context.Context, projectPath, iid string, autoMerge b
 	}
 
 	opts := &gogitlab.AcceptMergeRequestOptions{}
-	outcome := MergeOutcomeMerged
+	outcome := forge.MergeOutcomeMerged
 	if autoMerge {
 		opts.MergeWhenPipelineSucceeds = gogitlab.Ptr(true)
-		outcome = MergeOutcomeAutoMerge
+		outcome = forge.MergeOutcomeAutoMerge
 	}
 	_, resp, err := c.rest.MergeRequests.AcceptMergeRequest(projectPath, n, opts, gogitlab.WithContext(ctx))
 	if err == nil {
@@ -175,9 +166,9 @@ done:
 	return stripped
 }
 
-// Rebase asks GitLab to rebase the MR's source branch onto its target. The
-// rebase runs asynchronously server-side; this call just enqueues it.
-func (c *Client) Rebase(ctx context.Context, projectPath, iid string) error {
+// UpdateBranch asks GitLab to rebase the MR's source branch onto its target.
+// The rebase runs asynchronously server-side; this call just enqueues it.
+func (c *Client) UpdateBranch(ctx context.Context, projectPath, iid string) error {
 	n, err := iidInt(iid)
 	if err != nil {
 		return err

@@ -3,57 +3,20 @@ package gitlab
 import (
 	"context"
 	"time"
+
+	"github.com/hamkens/glx/internal/forge"
 )
 
-// Scope selects which set of merge requests to list, mapped onto the
-// currentUser GraphQL connections.
-type Scope string
-
-const (
-	ScopeAssigned Scope = "assigned" // assigned to me
-	ScopeReviewer Scope = "reviewer" // review requested from me
-	ScopeAuthored Scope = "authored" // I opened it
-)
-
-// connectionField maps a Scope to the currentUser GraphQL field name.
-func (s Scope) connectionField() string {
+// connectionField maps a scope to the currentUser GraphQL field name.
+func connectionField(s forge.Scope) string {
 	switch s {
-	case ScopeReviewer:
+	case forge.ScopeReviewer:
 		return "reviewRequestedMergeRequests"
-	case ScopeAuthored:
+	case forge.ScopeAuthored:
 		return "authoredMergeRequests"
 	default:
 		return "assignedMergeRequests"
 	}
-}
-
-// MR is the flattened merge-request row the TUI renders.
-type MR struct {
-	IID            string
-	Title          string
-	Draft          bool
-	Conflicts      bool
-	WebURL         string
-	ProjectPath    string
-	SourceBranch   string
-	TargetBranch   string
-	Author         string
-	Pipeline       string // GraphQL pipeline status, or "" if none
-	Approved       bool   // fully approved (requirements met)
-	ApprovedByMe   bool   // the authenticated user is among the approvers
-	ReviewState    string // authenticated user's state: REQUESTED, REVIEWED, APPROVED
-	ApprovalsLeft  int
-	DetailedStatus string // detailedMergeStatus, e.g. MERGEABLE, NEED_REBASE
-	PipelineID     int    // head pipeline numeric ID, 0 if none
-	UpdatedAt      string
-	MergedAt       string // RFC3339, empty unless this MR is merged
-}
-
-// MRPage is one page of results plus the cursor to fetch the next.
-type MRPage struct {
-	MRs         []MR
-	HasNextPage bool
-	EndCursor   string
 }
 
 // mrFields is the shared selection set for a merge-request node.
@@ -77,18 +40,18 @@ const mrFields = `
   headPipeline { id status }
 `
 
-// MergeRequests fetches one page of MRs for the given scope. Pass an empty
-// cursor for the first page; use the returned EndCursor for subsequent pages.
-// First-page results are cached (TTL); pass a WithForceRefresh context to skip.
-func (c *Client) MergeRequests(ctx context.Context, scope Scope, cursor string, pageSize int) (*MRPage, error) {
+// Changes fetches one page of MRs for the given scope. Pass an empty cursor for
+// the first page; use the returned EndCursor for subsequent pages. First-page
+// results are cached (TTL); pass a forge.WithForceRefresh context to skip.
+func (c *Client) Changes(ctx context.Context, scope forge.Scope, cursor string, pageSize int) (*forge.ChangePage, error) {
 	if pageSize <= 0 {
 		pageSize = 30
 	}
-	field := scope.connectionField()
+	field := connectionField(scope)
 
 	// Only cache the first page (cursor==""); paginated pages are transient.
 	cacheKey := string(scope)
-	if cursor == "" && !forced(ctx) {
+	if cursor == "" && !forge.Forced(ctx) {
 		if p, ok := c.mrListCache.Get(cacheKey, time.Now()); ok {
 			return p, nil
 		}
@@ -123,9 +86,9 @@ func (c *Client) MergeRequests(ctx context.Context, scope Scope, cursor string, 
 	return page, nil
 }
 
-// mergedScopeField maps a Scope to the connection used for *merged* MRs.
-func mergedScopeField(s Scope) string {
-	if s == ScopeReviewer {
+// mergedScopeField maps a scope to the connection used for *merged* MRs.
+func mergedScopeField(s forge.Scope) string {
+	if s == forge.ScopeReviewer {
 		return "reviewRequestedMergeRequests"
 	}
 	return "authoredMergeRequests"
@@ -133,16 +96,16 @@ func mergedScopeField(s Scope) string {
 
 // MergedSince fetches MRs (for the given scope) merged at or after the given
 // RFC3339 timestamp, newest first. Used for the recently-merged section.
-func (c *Client) MergedSince(ctx context.Context, scope Scope, since string, max int) ([]MR, error) {
+func (c *Client) MergedSince(ctx context.Context, scope forge.Scope, since string, max int) ([]forge.Change, error) {
 	if max <= 0 {
 		max = 30
 	}
 	field := mergedScopeField(scope)
 
 	cacheKey := "merged:" + string(scope) + ":" + since
-	if !forced(ctx) {
+	if !forge.Forced(ctx) {
 		if p, ok := c.mrListCache.Get(cacheKey, time.Now()); ok {
-			return p.MRs, nil
+			return p.Changes, nil
 		}
 	}
 
@@ -164,7 +127,7 @@ func (c *Client) MergedSince(ctx context.Context, scope Scope, since string, max
 	}
 	page := resp.CurrentUser[field].toPage(c.username)
 	c.mrListCache.Set(cacheKey, page, time.Now())
-	return page.MRs, nil
+	return page.Changes, nil
 }
 
 // mrConnection mirrors a GraphQL MR connection (pageInfo + nodes).
@@ -216,11 +179,11 @@ type mrNode struct {
 
 // toPage flattens the connection. me is the authenticated username, used to
 // compute ApprovedByMe (pass "" if unknown).
-func (conn mrConnection) toPage(me string) *MRPage {
-	page := &MRPage{
+func (conn mrConnection) toPage(me string) *forge.ChangePage {
+	page := &forge.ChangePage{
 		HasNextPage: conn.PageInfo.HasNextPage,
 		EndCursor:   conn.PageInfo.EndCursor,
-		MRs:         make([]MR, 0, len(conn.Nodes)),
+		Changes:     make([]forge.Change, 0, len(conn.Nodes)),
 	}
 	for _, n := range conn.Nodes {
 		approvedByMe := false
@@ -230,36 +193,36 @@ func (conn mrConnection) toPage(me string) *MRPage {
 				break
 			}
 		}
-		reviewState := ""
+		reviewState := forge.ReviewStateNone
 		for _, reviewer := range n.Reviewers.Nodes {
 			if me != "" && reviewer.Username == me {
-				reviewState = reviewer.MergeRequestInteraction.ReviewState
+				reviewState = forge.ParseGitLabReviewState(reviewer.MergeRequestInteraction.ReviewState)
 				break
 			}
 		}
-		mr := MR{
-			IID:            n.IID,
-			Title:          n.Title,
-			Draft:          n.Draft,
-			Conflicts:      n.Conflicts,
-			WebURL:         n.WebURL,
-			ProjectPath:    n.Project.FullPath,
-			SourceBranch:   n.SourceBranch,
-			TargetBranch:   n.TargetBranch,
-			Author:         n.Author.Username,
-			Approved:       n.Approved,
-			ApprovedByMe:   approvedByMe,
-			ReviewState:    reviewState,
-			ApprovalsLeft:  n.ApprovalsLeft,
-			DetailedStatus: n.DetailedMergeStatus,
-			UpdatedAt:      n.UpdatedAt,
-			MergedAt:       n.MergedAt,
+		mr := forge.Change{
+			ID:            n.IID,
+			Repo:          n.Project.FullPath,
+			Title:         n.Title,
+			Draft:         n.Draft,
+			Conflicts:     n.Conflicts,
+			WebURL:        n.WebURL,
+			SourceBranch:  n.SourceBranch,
+			TargetBranch:  n.TargetBranch,
+			Author:        n.Author.Username,
+			Approved:      n.Approved,
+			ApprovedByMe:  approvedByMe,
+			ReviewState:   reviewState,
+			ApprovalsLeft: n.ApprovalsLeft,
+			MergeState:    forge.ParseGitLabMergeState(n.DetailedMergeStatus),
+			UpdatedAt:     n.UpdatedAt,
+			MergedAt:      n.MergedAt,
 		}
 		if n.HeadPipeline != nil {
-			mr.Pipeline = n.HeadPipeline.Status
+			mr.Pipeline = forge.ParseGitLabStatus(n.HeadPipeline.Status)
 			mr.PipelineID = parseGID(n.HeadPipeline.ID)
 		}
-		page.MRs = append(page.MRs, mr)
+		page.Changes = append(page.Changes, mr)
 	}
 	return page
 }

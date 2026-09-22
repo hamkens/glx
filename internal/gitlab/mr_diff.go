@@ -5,38 +5,16 @@ import (
 	"time"
 
 	gogitlab "github.com/xanzy/go-gitlab"
+
+	"github.com/hamkens/glx/internal/forge"
 )
 
-// FileDiff is one changed file in a merge request.
-type FileDiff struct {
-	OldPath  string
-	NewPath  string
-	Diff     string // unified diff hunks (@@ ... @@)
-	NewFile  bool
-	Deleted  bool
-	Renamed  bool
-	TooLarge bool // GitLab omitted the diff body (too big to inline)
-}
-
-// DiffRefs are the SHAs required to position an inline comment on a diff.
-type DiffRefs struct {
-	BaseSHA  string
-	HeadSHA  string
-	StartSHA string
-}
-
-// MRDiff bundles the changed files with the refs needed to comment on them.
-type MRDiff struct {
-	Files []FileDiff
-	Refs  DiffRefs
-}
-
-// MergeRequestDiff fetches the changed files and diff refs for an MR via REST.
-// REST is used here (not GraphQL) because the raw unified-diff text and the
+// ChangeDiff fetches the changed files and diff refs for an MR via REST. REST is
+// used here (not GraphQL) because the raw unified-diff text and the
 // base/head/start SHAs for comment positioning are first-class in the REST API.
-func (c *Client) MergeRequestDiff(ctx context.Context, projectPath, iid string) (*MRDiff, error) {
+func (c *Client) ChangeDiff(ctx context.Context, projectPath, iid string) (*forge.Diff, error) {
 	cacheKey := projectPath + "!" + iid
-	if !forced(ctx) {
+	if !forge.Forced(ctx) {
 		if d, ok := c.mrDiffCache.Get(cacheKey, time.Now()); ok {
 			return d, nil
 		}
@@ -53,8 +31,8 @@ func (c *Client) MergeRequestDiff(ctx context.Context, projectPath, iid string) 
 		return nil, err
 	}
 
-	out := &MRDiff{
-		Refs: DiffRefs{
+	out := &forge.Diff{
+		Refs: forge.DiffRefs{
 			BaseSHA:  mr.DiffRefs.BaseSha,
 			HeadSHA:  mr.DiffRefs.HeadSha,
 			StartSHA: mr.DiffRefs.StartSha,
@@ -71,7 +49,7 @@ func (c *Client) MergeRequestDiff(ctx context.Context, projectPath, iid string) 
 			return nil, err
 		}
 		for _, d := range diffs {
-			out.Files = append(out.Files, FileDiff{
+			out.Files = append(out.Files, forge.FileDiff{
 				OldPath:  d.OldPath,
 				NewPath:  d.NewPath,
 				Diff:     d.Diff,

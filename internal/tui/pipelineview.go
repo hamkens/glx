@@ -11,12 +11,12 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/hamkens/glx/internal/gitlab"
+	"github.com/hamkens/glx/internal/forge"
 )
 
 // --- messages ---
 
-type pipelineLoadedMsg struct{ pipeline *gitlab.Pipeline }
+type pipelineLoadedMsg struct{ pipeline *forge.Pipeline }
 type pipelineErrMsg struct{ err error }
 type jobActionMsg struct {
 	verb string
@@ -25,7 +25,7 @@ type jobActionMsg struct {
 
 // pipelinePollMsg is the auto-refresh tick; id guards against stale ticks from
 // a previously-viewed pipeline.
-type pipelinePollMsg struct{ id int }
+type pipelinePollMsg struct{ id int64 }
 
 // pollInterval is how often an active pipeline is auto-refreshed.
 const pollInterval = 15 * time.Second
@@ -34,18 +34,20 @@ const pollInterval = 15 * time.Second
 type pipelineRow struct {
 	isStage bool
 	stage   string
-	job     gitlab.Job
+	job     forge.Job
 }
 
 // pipelineModel shows a pipeline's jobs grouped by stage with a cursor.
 type pipelineModel struct {
-	client      *gitlab.Client
-	projectPath string
-	pipelineID  int
-	mrIID       string // owning MR iid, for display/watch (may be empty)
+	client     forge.Forge
+	vocab      forge.Vocabulary
+	caps       forge.Capabilities
+	repo       string
+	pipelineID int64
+	changeID   string // owning change id, for display/watch (may be empty)
 
 	spinner spinner.Model
-	pipe    *gitlab.Pipeline
+	pipe    *forge.Pipeline
 	rows    []pipelineRow
 	cur     int // index into rows (job rows are selectable)
 	scroll  int
@@ -62,28 +64,30 @@ type pipelineModel struct {
 	height int
 }
 
-func newPipelineModel(client *gitlab.Client, projectPath string, pipelineID int, mrIID string) pipelineModel {
+func newPipelineModel(client forge.Forge, repo string, pipelineID int64, changeID string) pipelineModel {
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	return pipelineModel{
-		client:      client,
-		projectPath: projectPath,
-		pipelineID:  pipelineID,
-		mrIID:       mrIID,
-		spinner:     sp,
-		loading:     true,
+		client:     client,
+		vocab:      vocabForRepo(client, repo),
+		caps:       capsForRepo(client, repo),
+		repo:       repo,
+		pipelineID: pipelineID,
+		changeID:   changeID,
+		spinner:    sp,
+		loading:    true,
 	}
 }
 
 func (m pipelineModel) fetchCmd(force bool) tea.Cmd {
-	client, path, id := m.client, m.projectPath, m.pipelineID
+	client, repo, id := m.client, m.repo, m.pipelineID
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		defer cancel()
 		if force {
-			ctx = gitlab.WithForceRefresh(ctx)
+			ctx = forge.WithForceRefresh(ctx)
 		}
-		p, err := client.PipelineWithJobs(ctx, path, id)
+		p, err := client.PipelineWithJobs(ctx, repo, id)
 		if err != nil {
 			return pipelineErrMsg{err}
 		}
@@ -95,27 +99,18 @@ func (m pipelineModel) Init() tea.Cmd {
 	return tea.Batch(m.spinner.Tick, m.fetchCmd(false))
 }
 
-// activeStatus reports whether a status string represents an in-progress
-// pipeline or job worth polling for.
-func activeStatus(s string) bool {
-	switch s {
-	case "running", "pending", "created", "scheduled", "waiting_for_resource", "preparing", "manual":
-		return true
-	default:
-		return false
-	}
-}
-
-// isActive reports whether the pipeline (or any job) is still progressing.
+// isActive reports whether the pipeline (or any job) is still progressing, and
+// so is worth auto-refreshing. Manual jobs wait on a human, not on CI, so they
+// don't keep the poll loop alive.
 func (m pipelineModel) isActive() bool {
 	if m.pipe == nil {
 		return false
 	}
-	if activeStatus(m.pipe.Status) {
+	if m.pipe.Status.Active() {
 		return true
 	}
 	for _, j := range m.pipe.Jobs {
-		if activeStatus(j.Status) && j.Status != "manual" {
+		if j.Status.Active() {
 			return true
 		}
 	}
@@ -142,25 +137,25 @@ func (m pipelineModel) alertExpireCmd(seq int) tea.Cmd {
 
 // diffAlert compares two pipeline snapshots and returns a short change notice
 // (and a new sequence number) describing what changed, or "" if nothing did.
-func (m pipelineModel) diffAlert(prev, cur *gitlab.Pipeline) (string, int) {
+func (m pipelineModel) diffAlert(prev, cur *forge.Pipeline) (string, int) {
 	seq := m.alertSeq + 1
 
 	// Pipeline-level transition takes priority.
 	if prev.Status != cur.Status {
 		switch cur.Status {
-		case "success":
-			return lipgloss.NewStyle().Foreground(colorGreen).Render("✓ pipeline passed"), seq
-		case "failed":
-			return errStyle.Render("✘ pipeline failed"), seq
-		case "canceled":
-			return helpStyle.Render("○ pipeline canceled"), seq
+		case forge.StatusSuccess:
+			return lipgloss.NewStyle().Foreground(colorGreen).Render("✓ " + m.vocab.Pipeline + " passed"), seq
+		case forge.StatusFailed:
+			return errStyle.Render("✘ " + m.vocab.Pipeline + " failed"), seq
+		case forge.StatusCanceled:
+			return helpStyle.Render("○ " + m.vocab.Pipeline + " canceled"), seq
 		default:
-			return helpStyle.Render("pipeline → " + cur.Status), seq
+			return helpStyle.Render(m.vocab.Pipeline + " → " + cur.Status.String()), seq
 		}
 	}
 
 	// Otherwise report job-level changes (favor failures, then newly finished).
-	prevJobs := map[int]string{}
+	prevJobs := map[int64]forge.Status{}
 	for _, j := range prev.Jobs {
 		prevJobs[j.ID] = j.Status
 	}
@@ -170,10 +165,10 @@ func (m pipelineModel) diffAlert(prev, cur *gitlab.Pipeline) (string, int) {
 		if !ok || old == j.Status {
 			continue
 		}
-		if j.Status == "failed" {
+		if j.Status == forge.StatusFailed {
 			return errStyle.Render("✘ " + j.Name + " failed"), seq
 		}
-		if !activeStatus(j.Status) {
+		if !j.Status.Active() {
 			finished = append(finished, j.Name)
 		}
 	}
@@ -195,7 +190,7 @@ func (m *pipelineModel) buildRows() {
 		return
 	}
 	var stageOrder []string
-	byStage := map[string][]gitlab.Job{}
+	byStage := map[string][]forge.Job{}
 	for _, j := range m.pipe.Jobs {
 		if _, ok := byStage[j.Stage]; !ok {
 			stageOrder = append(stageOrder, j.Stage)
@@ -220,11 +215,11 @@ func (m *pipelineModel) buildRows() {
 	}
 }
 
-func (m pipelineModel) selectedJob() (gitlab.Job, bool) {
+func (m pipelineModel) selectedJob() (forge.Job, bool) {
 	if m.cur >= 0 && m.cur < len(m.rows) && !m.rows[m.cur].isStage {
 		return m.rows[m.cur].job, true
 	}
-	return gitlab.Job{}, false
+	return forge.Job{}, false
 }
 
 func (m pipelineModel) Update(msg tea.Msg) (pipelineModel, tea.Cmd) {
@@ -333,17 +328,17 @@ func (m pipelineModel) handleKey(msg tea.KeyMsg) (pipelineModel, tea.Cmd) {
 	return m, nil
 }
 
-func (m pipelineModel) jobActionCmd(verb string, jobID int) tea.Cmd {
-	client, path := m.client, m.projectPath
+func (m pipelineModel) jobActionCmd(verb string, jobID int64) tea.Cmd {
+	client, repo := m.client, m.repo
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		var err error
 		switch verb {
 		case "retried":
-			err = client.RetryJob(ctx, path, jobID)
+			err = client.RetryJob(ctx, repo, jobID)
 		case "canceled":
-			err = client.CancelJob(ctx, path, jobID)
+			err = client.CancelJob(ctx, repo, jobID)
 		}
 		return jobActionMsg{verb: verb, err: err}
 	}
@@ -384,20 +379,22 @@ func (m pipelineModel) paneHeight() int {
 
 func (m pipelineModel) View() string {
 	if m.loading && m.pipe == nil {
-		return fmt.Sprintf("\n  %s loading pipeline…", m.spinner.View())
+		return fmt.Sprintf("\n  %s loading %s…", m.spinner.View(), m.vocab.Pipeline)
 	}
 	if m.err != nil {
 		return "\n  " + errStyle.Render("error: "+m.err.Error()) + "\n  " + helpStyle.Render("esc back")
 	}
 	if m.pipe == nil {
-		return "\n  " + helpStyle.Render("no pipeline for this merge request") + "\n  " + helpStyle.Render("esc back")
+		return "\n  " + helpStyle.Render("no "+m.vocab.Pipeline+" for this "+m.vocab.Change) + "\n  " + helpStyle.Render("esc back")
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, m.header(), m.body(), m.footerWithAlert())
 }
 
 func (m pipelineModel) header() string {
 	p := m.pipe
-	title := titleStyle.Render(fmt.Sprintf("Pipeline #%d", p.ID)) + "  " + jobGlyph(p.Status) + " " + helpStyle.Render(p.Status)
+	heading := strings.ToUpper(m.vocab.Pipeline[:1]) + m.vocab.Pipeline[1:]
+	title := titleStyle.Render(fmt.Sprintf("%s #%d", heading, p.ID)) +
+		"  " + statusGlyph(p.Status) + " " + helpStyle.Render(p.Status.String())
 	if m.polling {
 		title += "  " + helpStyle.Render(m.spinner.View()+" auto-refresh")
 	}
@@ -453,7 +450,7 @@ func (m pipelineModel) body() string {
 		if j.AllowFailure {
 			af = helpStyle.Render("  (allow_fail)")
 		}
-		line := fmt.Sprintf("%s  %s %s%s%s", cursor, jobGlyph(j.Status), j.Name, dur, af)
+		line := fmt.Sprintf("%s  %s %s%s%s", cursor, statusGlyph(j.Status), j.Name, dur, af)
 		b.WriteString(truncateToWidth(line, m.width))
 		b.WriteByte('\n')
 	}

@@ -12,28 +12,29 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/reflow/truncate"
 
-	"github.com/hamkens/glx/internal/gitlab"
+	"github.com/hamkens/glx/internal/forge"
 )
 
-// scopeOrder defines the tab cycle and labels for MR scopes.
+// scopeOrder defines the tab cycle and labels for change scopes.
 var scopeOrder = []struct {
-	scope gitlab.Scope
+	scope forge.Scope
 	label string
 }{
-	{gitlab.ScopeReviewer, "Reviews"},
-	{gitlab.ScopeAuthored, "Authored"},
-	{gitlab.ScopeAssigned, "Assigned"},
+	{forge.ScopeReviewer, "Reviews"},
+	{forge.ScopeAuthored, "Authored"},
+	{forge.ScopeAssigned, "Assigned"},
 }
 
 // mrRow is a flattened display row: a section header ("Open"/"Merged"), a
-// project header, a blank spacer, or a merge-request row.
+// project header, a blank spacer, or a change row.
 type mrRow struct {
 	isSection bool
 	isHeader  bool
 	isSpacer  bool
 	section   string // for isSection
 	project   string // for isHeader
-	mr        gitlab.MR
+	host      string // for isHeader, when several hosts are connected
+	mr        forge.Change
 }
 
 func (r mrRow) selectable() bool { return !r.isHeader && !r.isSpacer && !r.isSection }
@@ -44,22 +45,22 @@ const mergedWindow = 12 * time.Hour
 // --- messages ---
 
 type mrsLoadedMsg struct {
-	scope  gitlab.Scope
-	page   *gitlab.MRPage
+	scope  forge.Scope
+	page   *forge.ChangePage
 	append bool // true when this is a "load more" page to append
 }
 
-// mergedLoadedMsg carries the recently-merged MRs for a scope.
+// mergedLoadedMsg carries the recently-merged changes for a scope.
 type mergedLoadedMsg struct {
-	scope gitlab.Scope
-	mrs   []gitlab.MR
+	scope forge.Scope
+	mrs   []forge.Change
 }
 
 // scopeSummaryLoadedMsg carries the complete open workload for a scope. It is
 // separate from mrsLoadedMsg so the list itself can remain paginated.
 type scopeSummaryLoadedMsg struct {
-	scope gitlab.Scope
-	mrs   []gitlab.MR
+	scope forge.Scope
+	mrs   []forge.Change
 }
 type mrsErrMsg struct{ err error }
 
@@ -75,23 +76,29 @@ type scopeSummary struct {
 	ciFailed  int
 	ciRunning int
 	conflicts int
-	rebases   int
+	behind    int // source branch is behind its target
 	threads   int
 }
 
 // --- model ---
 
 type mrListModel struct {
-	client      *gitlab.Client
+	client forge.Forge
+	// fleet is non-nil when more than one host is connected. It resolves the
+	// per-row vocabulary and capabilities a merged list needs, since a GitLab
+	// row and a GitHub row on the same screen want different words.
+	fleet       *forge.Fleet
+	vocab       forge.Vocabulary
+	caps        forge.Capabilities
 	spinner     spinner.Model
 	filterInput textinput.Model
 	scopeIdx    int
 
-	mrs    []gitlab.MR // open MRs, in server order
-	merged []gitlab.MR // recently-merged MRs (Authored/Reviews only)
-	rows   []mrRow     // derived display rows (headers + spacers + MRs)
-	cur    int         // index into rows; always points at a selectable row
-	scroll int         // index of the top visible row
+	mrs    []forge.Change // open changes, in server order
+	merged []forge.Change // recently-merged changes (Authored/Reviews only)
+	rows   []mrRow        // derived display rows (headers + spacers + changes)
+	cur    int            // index into rows; always points at a selectable row
+	scroll int            // index of the top visible row
 
 	filterMode  bool
 	loading     bool
@@ -104,10 +111,10 @@ type mrListModel struct {
 	width       int
 	height      int
 	lastSynced  string
-	summaries   map[gitlab.Scope]scopeSummary
+	summaries   map[forge.Scope]scopeSummary
 }
 
-func newMRListModel(client *gitlab.Client) mrListModel {
+func newMRListModel(client forge.Forge) mrListModel {
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 
@@ -115,20 +122,51 @@ func newMRListModel(client *gitlab.Client) mrListModel {
 	ti.Prompt = "/"
 	ti.Placeholder = "filter by title, project, or branch"
 
-	return mrListModel{
+	m := mrListModel{
 		client: client, spinner: sp, filterInput: ti, loading: true,
-		summaries: make(map[gitlab.Scope]scopeSummary),
+		vocab:     forge.Vocab(client.Provider()),
+		caps:      client.Capabilities(),
+		summaries: make(map[forge.Scope]scopeSummary),
 	}
+	// Only treat a Fleet as multi-host when it actually spans hosts; a
+	// single-member fleet keeps the plain single-host rendering.
+	if f, ok := client.(*forge.Fleet); ok {
+		if _, single := f.Single(); !single {
+			m.fleet = f
+		}
+	}
+	return m
 }
 
-func (m mrListModel) scope() gitlab.Scope { return scopeOrder[m.scopeIdx].scope }
+// multiHost reports whether rows can come from different hosts, which turns on
+// the host column and per-row wording.
+func (m mrListModel) multiHost() bool { return m.fleet != nil }
 
-// selected returns the MR under the cursor, or false if there is none.
-func (m mrListModel) selected() (gitlab.MR, bool) {
+// vocabFor is the wording to use for one row: the owning host's on a merged
+// list, the single connection's otherwise.
+func (m mrListModel) vocabFor(mr forge.Change) forge.Vocabulary {
+	if m.fleet == nil {
+		return m.vocab
+	}
+	return m.fleet.VocabFor(mr)
+}
+
+// capsFor is the capability set governing actions on one row.
+func (m mrListModel) capsFor(mr forge.Change) forge.Capabilities {
+	if m.fleet == nil {
+		return m.caps
+	}
+	return m.fleet.CapsFor(mr)
+}
+
+func (m mrListModel) scope() forge.Scope { return scopeOrder[m.scopeIdx].scope }
+
+// selected returns the change under the cursor, or false if there is none.
+func (m mrListModel) selected() (forge.Change, bool) {
 	if m.cur >= 0 && m.cur < len(m.rows) && m.rows[m.cur].selectable() {
 		return m.rows[m.cur].mr, true
 	}
-	return gitlab.MR{}, false
+	return forge.Change{}, false
 }
 
 // filtering reports whether the filter input is currently capturing keys.
@@ -138,14 +176,14 @@ func (m mrListModel) filtering() bool { return m.filterMode }
 // y/N confirmation, so the root shouldn't steal single-key shortcuts.
 func (m mrListModel) busy() bool { return m.filterMode || m.confirm != modeNone }
 
-// pageSize is how many MRs to request per page.
+// pageSize is how many changes to request per page.
 const pageSize = 50
 
 // scopeHasMerged reports whether the current scope shows a recently-merged
-// section. Assigned MRs aren't tracked for merge history here.
+// section. Assigned changes aren't tracked for merge history here.
 func (m mrListModel) scopeHasMerged() bool {
 	s := m.scope()
-	return s == gitlab.ScopeAuthored || s == gitlab.ScopeReviewer
+	return s == forge.ScopeAuthored || s == forge.ScopeReviewer
 }
 
 // fetchCmd loads the first page for the current scope. When force is true the
@@ -157,9 +195,9 @@ func (m mrListModel) fetchCmd(force bool) tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		if force {
-			ctx = gitlab.WithForceRefresh(ctx)
+			ctx = forge.WithForceRefresh(ctx)
 		}
-		page, err := client.MergeRequests(ctx, scope, "", pageSize)
+		page, err := client.Changes(ctx, scope, "", pageSize)
 		if err != nil {
 			return mrsErrMsg{err}
 		}
@@ -171,7 +209,7 @@ func (m mrListModel) fetchCmd(force bool) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-// mergedCmd loads MRs merged within mergedWindow for the current scope.
+// mergedCmd loads changes merged within mergedWindow for the current scope.
 func (m mrListModel) mergedCmd(force bool) tea.Cmd {
 	scope := m.scope()
 	client := m.client
@@ -180,7 +218,7 @@ func (m mrListModel) mergedCmd(force bool) tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		if force {
-			ctx = gitlab.WithForceRefresh(ctx)
+			ctx = forge.WithForceRefresh(ctx)
 		}
 		mrs, err := client.MergedSince(ctx, scope, since, 50)
 		if err != nil {
@@ -198,7 +236,7 @@ func (m mrListModel) loadMoreCmd() tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		page, err := client.MergeRequests(ctx, scope, cursor, pageSize)
+		page, err := client.Changes(ctx, scope, cursor, pageSize)
 		if err != nil {
 			return mrsErrMsg{err}
 		}
@@ -210,32 +248,32 @@ func (m mrListModel) Init() tea.Cmd {
 	return tea.Batch(
 		m.spinner.Tick,
 		m.fetchCmd(false),
-		m.summaryCmd(gitlab.ScopeReviewer, false),
-		m.summaryCmd(gitlab.ScopeAuthored, false),
+		m.summaryCmd(forge.ScopeReviewer, false),
+		m.summaryCmd(forge.ScopeAuthored, false),
 	)
 }
 
 // summaryCmd walks every page so tab badges describe the whole workload rather
 // than only the pages the user has visited.
-func (m mrListModel) summaryCmd(scope gitlab.Scope, force bool) tea.Cmd {
+func (m mrListModel) summaryCmd(scope forge.Scope, force bool) tea.Cmd {
 	client := m.client
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		if force {
-			ctx = gitlab.WithForceRefresh(ctx)
+			ctx = forge.WithForceRefresh(ctx)
 		}
 
-		all := make([]gitlab.MR, 0)
+		all := make([]forge.Change, 0)
 		cursor := ""
 		for {
-			page, err := client.MergeRequests(ctx, scope, cursor, 100)
+			page, err := client.Changes(ctx, scope, cursor, 100)
 			if err != nil {
 				// Summary metadata is supplementary; the main list request owns
 				// user-visible errors.
 				return scopeSummaryLoadedMsg{scope: scope}
 			}
-			all = append(all, page.MRs...)
+			all = append(all, page.Changes...)
 			if !page.HasNextPage {
 				break
 			}
@@ -245,56 +283,58 @@ func (m mrListModel) summaryCmd(scope gitlab.Scope, force bool) tea.Cmd {
 	}
 }
 
-// --- action commands (operate on the selected MR) ---
+// --- action commands (operate on the selected change) ---
 
-func (m mrListModel) approveActionCmd(mr gitlab.MR) tea.Cmd {
-	client := m.client
+func (m mrListModel) approveActionCmd(mr forge.Change) tea.Cmd {
+	client, vocab := m.client, m.vocabFor(mr)
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		verb, err := "approved", error(nil)
 		if mr.ApprovedByMe {
-			verb, err = "unapproved", client.Unapprove(ctx, mr.ProjectPath, mr.IID)
+			verb, err = vocab.Unapprove+"d", client.Unapprove(ctx, mr.Repo, mr.ID)
 		} else {
-			err = client.Approve(ctx, mr.ProjectPath, mr.IID)
+			err = client.Approve(ctx, mr.Repo, mr.ID)
 		}
 		return actionDoneMsg{verb: verb, err: err}
 	}
 }
 
-func (m mrListModel) mergeActionCmd(mr gitlab.MR, auto bool) tea.Cmd {
-	client := m.client
+func (m mrListModel) mergeActionCmd(mr forge.Change, auto bool) tea.Cmd {
+	client, vocab := m.client, m.vocabFor(mr)
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		outcome, err := client.Merge(ctx, mr.ProjectPath, mr.IID, auto)
+		outcome, err := client.Merge(ctx, mr.Repo, mr.ID, auto)
 		verb := "merged"
 		switch outcome {
-		case gitlab.MergeOutcomeTrain:
-			verb = "added to merge train"
-		case gitlab.MergeOutcomeAutoMerge:
+		case forge.MergeOutcomeTrain:
+			verb = "added to " + vocab.MergeQueue
+		case forge.MergeOutcomeAutoMerge:
 			verb = "auto-merge set"
 		}
 		return actionDoneMsg{verb: verb, err: err}
 	}
 }
 
-func (m mrListModel) rebaseActionCmd(mr gitlab.MR) tea.Cmd {
-	client := m.client
+// updateBranchActionCmd brings the source branch up to date with its target:
+// a rebase on GitLab, an update-branch merge on GitHub.
+func (m mrListModel) updateBranchActionCmd(mr forge.Change) tea.Cmd {
+	client, vocab := m.client, m.vocabFor(mr)
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		err := client.Rebase(ctx, mr.ProjectPath, mr.IID)
-		return actionDoneMsg{verb: "rebase started", err: err}
+		err := client.UpdateBranch(ctx, mr.Repo, mr.ID)
+		return actionDoneMsg{verb: vocab.UpdateBranchDone, err: err}
 	}
 }
 
-func (m mrListModel) setDraftActionCmd(mr gitlab.MR, draft bool) tea.Cmd {
+func (m mrListModel) setDraftActionCmd(mr forge.Change, draft bool) tea.Cmd {
 	client := m.client
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		err := client.SetDraft(ctx, mr.ProjectPath, mr.IID, mr.Title, draft)
+		err := client.SetDraft(ctx, mr.Repo, mr.ID, mr.Title, draft)
 		verb := "marked ready"
 		if draft {
 			verb = "marked as draft"
@@ -303,26 +343,30 @@ func (m mrListModel) setDraftActionCmd(mr gitlab.MR, draft bool) tea.Cmd {
 	}
 }
 
-// listMergeBlock returns why the list-row MR can't be merged now, using the
-// limited fields a list row carries (detailed status, approvals, draft).
-func listMergeBlock(mr gitlab.MR) string {
+// listMergeBlock returns why the list-row change can't be merged now, using the
+// limited fields a list row carries (merge state, approvals, draft).
+func listMergeBlock(mr forge.Change, v forge.Vocabulary) string {
 	if mr.Draft {
-		return "merge request is still a draft"
+		return v.Change + " is still a draft"
 	}
 	if mr.Conflicts {
 		return "has conflicts that must be resolved"
 	}
-	switch mr.DetailedStatus {
-	case "NEED_REBASE":
-		return "needs rebase onto target branch (press b to rebase)"
-	case "CI_STILL_RUNNING":
-		return "pipeline must finish first"
-	case "CI_MUST_PASS":
-		return "pipeline must pass first"
-	case "DISCUSSIONS_NOT_RESOLVED":
-		return "open threads must be resolved"
-	case "BLOCKED_STATUS":
-		return "blocked by another merge request"
+	switch mr.MergeState {
+	case forge.MergeStateNeedsUpdate:
+		return fmt.Sprintf("is behind its target branch (press b to %s)", v.UpdateBranch)
+	case forge.MergeStateConflict:
+		return "has conflicts that must be resolved"
+	case forge.MergeStateCIRunning:
+		return v.Pipeline + " must finish first"
+	case forge.MergeStateCIFailed:
+		return v.Pipeline + " must pass first"
+	case forge.MergeStateThreadsUnresolved:
+		return "open " + v.Threads + " must be resolved"
+	case forge.MergeStateChangesRequested:
+		return "a reviewer requested changes"
+	case forge.MergeStateBlocked:
+		return "blocked by a branch rule or another " + v.Change
 	}
 	if mr.ApprovalsLeft > 0 {
 		return fmt.Sprintf("%d more approval(s) required", mr.ApprovalsLeft)
@@ -330,33 +374,31 @@ func listMergeBlock(mr gitlab.MR) string {
 	return ""
 }
 
-// listAutoMergeBlock is like listMergeBlock but tolerates a running pipeline.
-func listAutoMergeBlock(mr gitlab.MR) string {
-	if mr.DetailedStatus == "CI_STILL_RUNNING" || mr.DetailedStatus == "CI_MUST_PASS" {
+// listAutoMergeBlock is like listMergeBlock but tolerates a running pipeline,
+// since waiting for CI is exactly what auto-merge is for.
+func listAutoMergeBlock(mr forge.Change, v forge.Vocabulary) string {
+	if mr.MergeState.CIPending() {
 		if mr.Draft {
-			return "merge request is still a draft"
+			return v.Change + " is still a draft"
 		}
 		if mr.Conflicts {
 			return "has conflicts that must be resolved"
 		}
-		if mr.DetailedStatus == "NEED_REBASE" {
-			return "needs rebase onto target branch (press b to rebase)"
-		}
 		return ""
 	}
-	return listMergeBlock(mr)
+	return listMergeBlock(mr, v)
 }
 
-// applyFilter returns the MRs matching the current filter query.
-func (m mrListModel) applyFilter(mrs []gitlab.MR) []gitlab.MR {
+// applyFilter returns the changes matching the current filter query.
+func (m mrListModel) applyFilter(mrs []forge.Change) []forge.Change {
 	q := strings.ToLower(strings.TrimSpace(m.filterInput.Value()))
 	if q == "" {
 		return mrs
 	}
 	terms := strings.Fields(q)
-	var out []gitlab.MR
+	var out []forge.Change
 	for _, mr := range mrs {
-		hay := strings.ToLower(mr.Title + " " + mr.ProjectPath + " " + mr.SourceBranch)
+		hay := strings.ToLower(mr.Title + " " + mr.Repo + " " + mr.SourceBranch)
 		if containsAll(hay, terms) {
 			out = append(out, mr)
 		}
@@ -364,8 +406,8 @@ func (m mrListModel) applyFilter(mrs []gitlab.MR) []gitlab.MR {
 	return out
 }
 
-// visibleMRs is the filtered set of open MRs (used for counts).
-func (m mrListModel) visibleMRs() []gitlab.MR { return m.applyFilter(m.mrs) }
+// visibleMRs is the filtered set of open changes (used for counts).
+func (m mrListModel) visibleMRs() []forge.Change { return m.applyFilter(m.mrs) }
 
 func containsAll(hay string, terms []string) bool {
 	for _, t := range terms {
@@ -376,29 +418,34 @@ func containsAll(hay string, terms []string) bool {
 	return true
 }
 
-// appendGrouped appends project-grouped rows for mrs to m.rows.
-func (m *mrListModel) appendGrouped(mrs []gitlab.MR) {
-	var order []string
-	groups := map[string][]gitlab.MR{}
+// appendGrouped appends project-grouped rows for mrs to m.rows. Grouping is
+// keyed by host and repo, since two hosts can serve repos with the same path;
+// the incoming order of first appearance decides group order, which keeps the
+// newest-updated-first merge from being reshuffled alphabetically.
+func (m *mrListModel) appendGrouped(mrs []forge.Change) {
+	type groupKey struct{ host, repo string }
+	var order []groupKey
+	groups := map[groupKey][]forge.Change{}
 	for _, mr := range mrs {
-		if _, ok := groups[mr.ProjectPath]; !ok {
-			order = append(order, mr.ProjectPath)
+		k := groupKey{mr.Host, mr.Repo}
+		if _, ok := groups[k]; !ok {
+			order = append(order, k)
 		}
-		groups[mr.ProjectPath] = append(groups[mr.ProjectPath], mr)
+		groups[k] = append(groups[k], mr)
 	}
-	for gi, proj := range order {
+	for gi, k := range order {
 		if gi > 0 {
 			m.rows = append(m.rows, mrRow{isSpacer: true})
 		}
-		m.rows = append(m.rows, mrRow{isHeader: true, project: proj})
-		for _, mr := range groups[proj] {
+		m.rows = append(m.rows, mrRow{isHeader: true, project: k.repo, host: k.host})
+		for _, mr := range groups[k] {
 			m.rows = append(m.rows, mrRow{mr: mr})
 		}
 	}
 }
 
 // rebuildRows builds the display rows: an "Open" section grouped by project,
-// then (when the scope tracks it) a "Merged" section of recently-merged MRs.
+// then (when the scope tracks it) a "Merged" section of recently-merged changes.
 func (m *mrListModel) rebuildRows() {
 	m.rows = nil
 
@@ -406,7 +453,7 @@ func (m *mrListModel) rebuildRows() {
 	merged := m.applyFilter(m.merged)
 
 	// Only show the "Open" section header when a merged section follows;
-	// otherwise the list is unambiguously the open MRs.
+	// otherwise the list is unambiguously the open changes.
 	showSections := len(merged) > 0
 
 	if showSections {
@@ -496,9 +543,9 @@ func (m mrListModel) Update(msg tea.Msg) (mrListModel, tea.Cmd) {
 		m.cursor = msg.page.EndCursor
 		m.hasNext = msg.page.HasNextPage
 		if msg.append {
-			m.mrs = append(m.mrs, msg.page.MRs...)
+			m.mrs = append(m.mrs, msg.page.Changes...)
 		} else {
-			m.mrs = msg.page.MRs
+			m.mrs = msg.page.Changes
 			m.lastSynced = nowHM()
 			m.cur, m.scroll = 0, 0
 		}
@@ -611,14 +658,26 @@ func (m mrListModel) handleKey(msg tea.KeyMsg) (mrListModel, tea.Cmd) {
 		m.moveCursor(1)
 	case "up", "k":
 		m.moveCursor(-1)
+	case "pgdown":
+		if m.scopeHasMerged() {
+			m.moveCursor(m.halfPage())
+		}
+	case "pgup":
+		if m.scopeHasMerged() {
+			m.moveCursor(-m.halfPage())
+		}
 	case "a":
 		if mr, ok := m.selected(); ok && mr.MergedAt == "" {
+			if mr.ApprovedByMe && !m.capsFor(mr).Unapprove {
+				m.flash = errStyle.Render("✘ " + m.vocabFor(mr).Unapprove + " is not supported here")
+				return m, nil
+			}
 			m.flash = "submitting approval…"
 			return m, m.approveActionCmd(mr)
 		}
 	case "M":
 		if mr, ok := m.selected(); ok && mr.MergedAt == "" {
-			if reason := listMergeBlock(mr); reason != "" {
+			if reason := listMergeBlock(mr, m.vocabFor(mr)); reason != "" {
 				m.flash = errStyle.Render("✘ can't merge: " + reason)
 				return m, nil
 			}
@@ -626,7 +685,11 @@ func (m mrListModel) handleKey(msg tea.KeyMsg) (mrListModel, tea.Cmd) {
 		}
 	case "A":
 		if mr, ok := m.selected(); ok && mr.MergedAt == "" {
-			if reason := listAutoMergeBlock(mr); reason != "" {
+			if !m.capsFor(mr).AutoMerge {
+				m.flash = errStyle.Render("✘ auto-merge is not supported here")
+				return m, nil
+			}
+			if reason := listAutoMergeBlock(mr, m.vocabFor(mr)); reason != "" {
 				m.flash = errStyle.Render("✘ can't auto-merge: " + reason)
 				return m, nil
 			}
@@ -634,11 +697,15 @@ func (m mrListModel) handleKey(msg tea.KeyMsg) (mrListModel, tea.Cmd) {
 		}
 	case "b":
 		if mr, ok := m.selected(); ok && mr.MergedAt == "" {
-			m.flash = "rebasing…"
-			return m, m.rebaseActionCmd(mr)
+			m.flash = m.vocabFor(mr).UpdateBranchGerund + "…"
+			return m, m.updateBranchActionCmd(mr)
 		}
 	case "D":
 		if mr, ok := m.selected(); ok && mr.MergedAt == "" {
+			if !m.capsFor(mr).DraftToggle {
+				m.flash = errStyle.Render("✘ toggling draft is not supported here")
+				return m, nil
+			}
 			draft := !mr.Draft
 			if draft {
 				m.flash = "marking as draft…"
@@ -665,6 +732,11 @@ func (m *mrListModel) moveCursor(delta int) {
 		m.cur = i
 		m.scrollToCursor()
 	}
+}
+
+// halfPage is the number of display rows a Page Up/Down key traverses.
+func (m mrListModel) halfPage() int {
+	return max(1, m.listHeight()/2)
 }
 
 // resetPaging clears the list and pagination state before a fresh load.
@@ -704,13 +776,13 @@ func (m mrListModel) View() string {
 	var body string
 	switch {
 	case m.loading && len(m.mrs) == 0:
-		body = fmt.Sprintf("\n  %s loading merge requests…", m.spinner.View())
+		body = fmt.Sprintf("\n  %s loading %s…", m.spinner.View(), m.vocab.Changes)
 	case m.err != nil:
 		body = "\n  " + errStyle.Render("error: "+m.err.Error())
 	case len(m.rows) == 0 && m.filterInput.Value() != "":
-		body = "\n  " + helpStyle.Render("no merge requests match the filter")
+		body = "\n  " + helpStyle.Render("no "+m.vocab.Changes+" match the filter")
 	case len(m.rows) == 0:
-		body = "\n  " + helpStyle.Render("no open merge requests in this scope")
+		body = "\n  " + helpStyle.Render("no open "+m.vocab.Changes+" in this scope")
 	default:
 		body = m.rowsView()
 	}
@@ -744,7 +816,7 @@ func (m mrListModel) rowsView() string {
 	}
 	activeProject := ""
 	if mr, ok := m.selected(); ok {
-		activeProject = mr.ProjectPath
+		activeProject = mr.Repo
 	}
 
 	var b strings.Builder
@@ -772,14 +844,22 @@ func (m mrListModel) renderRow(i int, activeProject string) string {
 		if r.project == activeProject {
 			style = lipgloss.NewStyle().Bold(true).Foreground(colorAccent)
 		}
-		return truncateToWidth("  "+style.Render(r.project), m.width)
+		line := "  " + style.Render(r.project)
+		// On a merged list the host is what disambiguates one repo from another
+		// with the same path, so it rides along with the group header rather than
+		// costing every row a column.
+		if m.multiHost() && r.host != "" {
+			line += " " + helpStyle.Render(r.host)
+		}
+		return truncateToWidth(line, m.width)
 	}
 
 	mr := r.mr
+	vocab := m.vocabFor(mr)
 	merged := mr.MergedAt != ""
-	pipe := pipelineGlyph(mr.Pipeline)
+	pipe := statusGlyph(mr.Pipeline)
 
-	// Second column: approval state for open MRs, merge time for merged ones.
+	// Second column: approval state for open changes, merge time for merged ones.
 	var second string
 	if merged {
 		second = lipgloss.NewStyle().Foreground(colorSubtle).Render(relAge(mr.MergedAt))
@@ -795,12 +875,12 @@ func (m mrListModel) renderRow(i int, activeProject string) string {
 		if mr.Conflicts {
 			flags += errStyle.Render(" conflict")
 		}
-		if tag := mergeStatusTag(mr.DetailedStatus); tag != "" {
+		if tag := mergeStateTag(mr.MergeState, vocab); tag != "" {
 			flags += " " + tag
 		}
 	}
 
-	iid := lipgloss.NewStyle().Foreground(colorSubtle).Render("!" + mr.IID)
+	id := lipgloss.NewStyle().Foreground(colorSubtle).Render(vocab.IDPrefix + mr.ID)
 	title := mr.Title
 	cursor := "  "
 	if i == m.cur {
@@ -808,7 +888,7 @@ func (m mrListModel) renderRow(i int, activeProject string) string {
 		title = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Render(title)
 	}
 
-	line := fmt.Sprintf("%s%s %s %s  %s%s", cursor, pipe, second, iid, title, flags)
+	line := fmt.Sprintf("%s%s %s %s  %s%s", cursor, pipe, second, id, title, flags)
 	return truncateToWidth(line, m.width)
 }
 
@@ -837,9 +917,9 @@ func (m mrListModel) statusBar() string {
 		label := scope.label
 		if summary, ok := m.summaries[scope.scope]; ok {
 			switch scope.scope {
-			case gitlab.ScopeReviewer:
+			case forge.ScopeReviewer:
 				label += fmt.Sprintf(" %d", summary.pending)
-			case gitlab.ScopeAuthored:
+			case forge.ScopeAuthored:
 				label += fmt.Sprintf(" %d ready", summary.ready)
 			}
 		}
@@ -855,6 +935,11 @@ func (m mrListModel) statusBar() string {
 	}
 
 	right := helpStyle.Render(m.client.Host())
+	// A host that failed its last read is named here, so a partial list never
+	// silently reads as the whole workload. "r" retries it.
+	if bad := m.degradedHosts(); bad != "" {
+		right = errStyle.Render("✘ "+bad) + helpStyle.Render("  "+m.client.Host())
+	}
 	if detail := m.scopeSummaryDetail(); detail != "" {
 		right += helpStyle.Render("  " + detail)
 	}
@@ -874,14 +959,26 @@ func (m mrListModel) statusBar() string {
 	return statusBarStyle.Width(m.width).Render(left + strings.Repeat(" ", gap) + right)
 }
 
+// degradedHosts names the hosts whose last read failed, for the status bar.
+func (m mrListModel) degradedHosts() string {
+	if m.fleet == nil {
+		return ""
+	}
+	bad := m.fleet.Degraded()
+	if len(bad) == 0 {
+		return ""
+	}
+	return strings.Join(bad, ", ") + " unreachable"
+}
+
 const staleReviewAge = 48 * time.Hour
 
-func summarizeScope(scope gitlab.Scope, mrs []gitlab.MR, now time.Time) scopeSummary {
+func summarizeScope(scope forge.Scope, mrs []forge.Change, now time.Time) scopeSummary {
 	var summary scopeSummary
 	for _, mr := range mrs {
 		switch scope {
-		case gitlab.ScopeReviewer:
-			if mr.Draft || mr.ReviewState != "REQUESTED" {
+		case forge.ScopeReviewer:
+			if mr.Draft || !mr.ReviewState.Pending() {
 				continue
 			}
 			summary.pending++
@@ -897,7 +994,7 @@ func summarizeScope(scope gitlab.Scope, mrs []gitlab.MR, now time.Time) scopeSum
 				summary.oldest = age
 			}
 
-		case gitlab.ScopeAuthored:
+		case forge.ScopeAuthored:
 			if readyToMerge(mr) {
 				summary.ready++
 				continue
@@ -906,22 +1003,22 @@ func summarizeScope(scope gitlab.Scope, mrs []gitlab.MR, now time.Time) scopeSum
 			if mr.Draft {
 				summary.drafts++
 			}
-			if mr.ApprovalsLeft > 0 || mr.DetailedStatus == "NOT_APPROVED" {
+			if mr.ApprovalsLeft > 0 || mr.MergeState == forge.MergeStateNotApproved {
 				summary.approvals++
 			}
-			if mr.Pipeline == "FAILED" {
+			if mr.Pipeline == forge.StatusFailed || mr.MergeState == forge.MergeStateCIFailed {
 				summary.ciFailed++
 			}
-			if mr.Pipeline == "RUNNING" || mr.Pipeline == "PENDING" || mr.DetailedStatus == "CI_STILL_RUNNING" {
+			if mr.Pipeline.Active() || mr.MergeState == forge.MergeStateCIRunning {
 				summary.ciRunning++
 			}
-			if mr.Conflicts || mr.DetailedStatus == "CONFLICT" {
+			if mr.Conflicts || mr.MergeState == forge.MergeStateConflict {
 				summary.conflicts++
 			}
-			if mr.DetailedStatus == "NEED_REBASE" {
-				summary.rebases++
+			if mr.MergeState == forge.MergeStateNeedsUpdate {
+				summary.behind++
 			}
-			if mr.DetailedStatus == "DISCUSSIONS_NOT_RESOLVED" {
+			if mr.MergeState == forge.MergeStateThreadsUnresolved {
 				summary.threads++
 			}
 		}
@@ -929,8 +1026,10 @@ func summarizeScope(scope gitlab.Scope, mrs []gitlab.MR, now time.Time) scopeSum
 	return summary
 }
 
-func readyToMerge(mr gitlab.MR) bool {
-	return mr.DetailedStatus == "MERGEABLE" && listMergeBlock(mr) == ""
+// readyToMerge reports whether an authored change has nothing standing between
+// it and a merge. Vocabulary is irrelevant here: only the blocker's presence is.
+func readyToMerge(mr forge.Change) bool {
+	return mr.MergeState.Mergeable() && listMergeBlock(mr, forge.Vocabulary{}) == ""
 }
 
 func (m mrListModel) scopeSummaryDetail() string {
@@ -941,17 +1040,17 @@ func (m mrListModel) scopeSummaryDetail() string {
 
 	var parts []string
 	switch m.scope() {
-	case gitlab.ScopeReviewer:
+	case forge.ScopeReviewer:
 		parts = appendCount(parts, summary.stale, "stale", "stale")
 		if summary.pending > 0 && summary.oldest > 0 {
 			parts = append(parts, "oldest "+shortAge(summary.oldest))
 		}
-	case gitlab.ScopeAuthored:
+	case forge.ScopeAuthored:
 		parts = appendCount(parts, summary.approvals, "approval", "approvals")
 		parts = appendCount(parts, summary.ciFailed, "CI failed", "CI failed")
-		parts = appendCount(parts, summary.rebases, "rebase", "rebases")
+		parts = appendCount(parts, summary.behind, m.vocab.UpdateBranch, m.vocab.UpdateBranch)
 		parts = appendCount(parts, summary.conflicts, "conflict", "conflicts")
-		parts = appendCount(parts, summary.threads, "thread", "threads")
+		parts = appendCount(parts, summary.threads, m.vocab.Thread, m.vocab.Threads)
 		parts = appendCount(parts, summary.ciRunning, "CI running", "CI running")
 		parts = appendCount(parts, summary.drafts, "draft", "drafts")
 		if len(parts) == 0 && summary.blocked > 0 {
@@ -986,9 +1085,9 @@ func shortAge(d time.Duration) string {
 func (m mrListModel) bottomLine() string {
 	switch m.confirm {
 	case modeConfirmMerge:
-		return errStyle.Render("  merge this MR now? [y/N]")
+		return errStyle.Render("  merge this " + m.vocab.ChangeAbbrev + " now? [y/N]")
 	case modeConfirmAutoMerge:
-		return errStyle.Render("  set auto-merge (merge when pipeline succeeds)? [y/N]")
+		return errStyle.Render("  set auto-merge (merge when checks pass)? [y/N]")
 	}
 	if m.filterMode {
 		return "  " + m.filterInput.View()
@@ -1000,7 +1099,7 @@ func (m mrListModel) bottomLine() string {
 		return helpStyle.Render("  filter: ") + lipgloss.NewStyle().Foreground(colorAccent).Render(q) +
 			helpStyle.Render("  (esc to clear)")
 	}
-	return helpStyle.Render("  enter open · a/M/A/b act · d diff · p pipeline · / filter · ? help")
+	return helpStyle.Render(fmt.Sprintf("  enter open · a/M/A/b act · d diff · p %s · / filter · ? help", m.vocab.Pipeline))
 }
 
 func nowHM() string {

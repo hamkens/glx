@@ -12,7 +12,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/hamkens/glx/internal/browser"
-	"github.com/hamkens/glx/internal/gitlab"
+	"github.com/hamkens/glx/internal/forge"
 	"github.com/hamkens/glx/internal/watch"
 )
 
@@ -38,9 +38,10 @@ const (
 )
 
 // rootModel routes between views. enter opens the detail view for the
-// selected MR; d opens the diff; esc/backspace steps back one level.
+// selected change; d opens the diff; esc/backspace steps back one level.
 type rootModel struct {
-	client      *gitlab.Client
+	client      forge.Forge
+	vocab       forge.Vocabulary
 	view        view
 	watchReturn view // view to return to when leaving the watch screen
 	pipeReturn  view // view to return to when leaving the pipeline screen
@@ -76,8 +77,8 @@ func (m rootModel) inputActive() bool {
 	}
 }
 
-// currentURL returns the GitLab web URL for whatever is focused in the active
-// view, or "" if nothing sensible is available.
+// currentURL returns the provider's web URL for whatever is focused in the
+// active view, or "" if nothing sensible is available.
 func (m rootModel) currentURL() string {
 	switch m.view {
 	case viewList:
@@ -89,9 +90,8 @@ func (m rootModel) currentURL() string {
 			return m.detail.detail.WebURL
 		}
 	case viewDiff:
-		// No diff-specific URL stored; link to the MR's diffs tab.
-		return fmt.Sprintf("https://%s/%s/-/merge_requests/%s/diffs",
-			m.client.Host(), m.diff.projectPath, m.diff.iid)
+		// No diff-specific URL stored; link to the change's diff tab.
+		return m.client.DiffURL(m.diff.repo, m.diff.id)
 	case viewPipeline:
 		if m.pipeline.pipe != nil {
 			return m.pipeline.pipe.WebURL
@@ -103,25 +103,25 @@ func (m rootModel) currentURL() string {
 }
 
 // focusedPipeline resolves the pipeline associated with the current view's
-// focus (project path, pipeline id, owning MR iid). ok is false when there is
+// focus (repo path, pipeline id, owning change id). ok is false when there is
 // no pipeline to act on.
-func (m rootModel) focusedPipeline() (path string, pid int, mrIID string, ok bool) {
+func (m rootModel) focusedPipeline() (repo string, pid int64, changeID string, ok bool) {
 	switch m.view {
 	case viewList:
 		if mr, sel := m.mrList.selected(); sel && mr.PipelineID > 0 {
-			return mr.ProjectPath, mr.PipelineID, mr.IID, true
+			return mr.Repo, mr.PipelineID, mr.ID, true
 		}
 	case viewDetail:
 		if d := m.detail.detail; d != nil && d.PipelineID > 0 {
-			return m.detail.projectPath, d.PipelineID, m.detail.iid, true
+			return m.detail.repo, d.PipelineID, m.detail.id, true
 		}
 	case viewPipeline:
 		if m.pipeline.pipe != nil {
-			return m.pipeline.projectPath, m.pipeline.pipe.ID, m.pipeline.mrIID, true
+			return m.pipeline.repo, m.pipeline.pipe.ID, m.pipeline.changeID, true
 		}
 	case viewWatch:
 		if e, sel := m.watchView.selected(); sel {
-			return e.ProjectPath, e.PipelineID, e.MRIID, true
+			return e.Repo, e.PipelineID, e.ChangeID, true
 		}
 	}
 	return "", 0, "", false
@@ -151,13 +151,13 @@ func ringBell() {
 
 // formatWatchAlert renders a watch.Change as a discreet, colored alert line.
 func formatWatchAlert(ch watch.Change) string {
-	proj := shortProject(ch.Entry.ProjectPath)
+	proj := shortProject(ch.Entry.Repo)
 	id := fmt.Sprintf("#%d", ch.Entry.PipelineID)
 	switch ch.Kind {
 	case watch.PipelineFailed:
 		return errStyle.Render(fmt.Sprintf("✘ %s %s failed", proj, id))
 	case watch.PipelineDone:
-		if ch.NewStatus == "canceled" {
+		if ch.NewStatus == forge.StatusCanceled {
 			return helpStyle.Render(fmt.Sprintf("○ %s %s canceled", proj, id))
 		}
 		return lipgloss.NewStyle().Foreground(colorGreen).Render(fmt.Sprintf("✓ %s %s passed", proj, id))
@@ -185,8 +185,8 @@ type watchTickMsg struct{}
 
 // watchResultMsg carries the fetched pipelines from one poll round.
 type watchResultMsg struct {
-	pipelines []*gitlab.Pipeline
-	paths     []string // parallel to pipelines: project path per result
+	pipelines []*forge.Pipeline
+	repos     []string // parallel to pipelines: repo path per result
 }
 
 // watchTickCmd schedules the next background poll.
@@ -203,13 +203,13 @@ func (m rootModel) pollWatchedCmd() tea.Cmd {
 		var res watchResultMsg
 		for _, t := range targets {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			p, err := client.PipelineWithJobs(gitlab.WithForceRefresh(ctx), t.ProjectPath, t.PipelineID)
+			p, err := client.PipelineWithJobs(forge.WithForceRefresh(ctx), t.Repo, t.PipelineID)
 			cancel()
 			if err != nil || p == nil {
 				continue
 			}
 			res.pipelines = append(res.pipelines, p)
-			res.paths = append(res.paths, t.ProjectPath)
+			res.repos = append(res.repos, t.Repo)
 		}
 		return res
 	}
@@ -226,9 +226,10 @@ func (m *rootModel) startWatchingCmd() tea.Cmd {
 }
 
 // New builds the root Bubble Tea model.
-func New(client *gitlab.Client) tea.Model {
+func New(client forge.Forge) tea.Model {
 	return rootModel{
 		client: client,
+		vocab:  forge.Vocab(client.Provider()),
 		view:   viewList,
 		mrList: newMRListModel(client),
 		watch:  watch.New(),
@@ -270,7 +271,7 @@ func (m rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case watchResultMsg:
 		var bell tea.Cmd
 		for i, p := range msg.pipelines {
-			if ch := m.watch.Update(msg.paths[i], p); ch.Kind != watch.ChangeNone {
+			if ch := m.watch.Update(msg.repos[i], p); ch.Kind != watch.ChangeNone {
 				m.alert = formatWatchAlert(ch)
 				if ch.Kind == watch.PipelineFailed || ch.Kind == watch.PipelineDone || ch.Kind == watch.JobFailed {
 					bell = func() tea.Msg { return ringBellMsg{} }
@@ -327,8 +328,8 @@ func (m rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch key.String() {
 			case "w":
 				// Toggle watch on the focused pipeline.
-				if path, pid, mrIID, ok := m.focusedPipeline(); ok {
-					if m.watch.Toggle(path, pid, mrIID) {
+				if repo, pid, changeID, ok := m.focusedPipeline(); ok {
+					if m.watch.Toggle(repo, pid, changeID) {
 						m.alert = helpStyle.Render(fmt.Sprintf("👁 watching #%d", pid))
 						return m, m.startWatchingCmd()
 					}
@@ -379,7 +380,7 @@ func (m rootModel) updateWatch(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Open the selected watched pipeline in the full pipeline view.
 			if e, sel := m.watchView.selected(); sel {
 				m.pipeReturn = viewWatch
-				m.pipeline = newPipelineModel(m.client, e.ProjectPath, e.PipelineID, e.MRIID)
+				m.pipeline = newPipelineModel(m.client, e.Repo, e.PipelineID, e.ChangeID)
 				m.view = viewPipeline
 				var szCmd tea.Cmd
 				m.pipeline, szCmd = m.pipeline.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
@@ -402,7 +403,7 @@ func (m rootModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "enter":
 			if mr, ok := m.mrList.selected(); ok {
-				m.detail = newDetailModel(m.client, mr.ProjectPath, mr.IID)
+				m.detail = newDetailModel(m.client, mr.Repo, mr.ID)
 				m.view = viewDetail
 				var szCmd tea.Cmd
 				m.detail, szCmd = m.detail.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
@@ -410,7 +411,7 @@ func (m rootModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "d":
 			if mr, ok := m.mrList.selected(); ok {
-				m.diff = newDiffModel(m.client, mr.ProjectPath, mr.IID)
+				m.diff = newDiffModel(m.client, mr.Repo, mr.ID)
 				m.view = viewDiff
 				var szCmd tea.Cmd
 				m.diff, szCmd = m.diff.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
@@ -419,7 +420,7 @@ func (m rootModel) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "p":
 			if mr, ok := m.mrList.selected(); ok && mr.PipelineID > 0 {
 				m.pipeReturn = viewList
-				m.pipeline = newPipelineModel(m.client, mr.ProjectPath, mr.PipelineID, mr.IID)
+				m.pipeline = newPipelineModel(m.client, mr.Repo, mr.PipelineID, mr.ID)
 				m.view = viewPipeline
 				var szCmd tea.Cmd
 				m.pipeline, szCmd = m.pipeline.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
@@ -453,7 +454,7 @@ func (m rootModel) updateDetail(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "d":
 			// Open the diff viewer for this MR.
 			if m.detail.mode == modeNone {
-				m.diff = newDiffModel(m.client, m.detail.projectPath, m.detail.iid)
+				m.diff = newDiffModel(m.client, m.detail.repo, m.detail.id)
 				m.view = viewDiff
 				var szCmd tea.Cmd
 				m.diff, szCmd = m.diff.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
@@ -463,7 +464,7 @@ func (m rootModel) updateDetail(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Open the pipeline view, if this MR has a head pipeline.
 			if m.detail.mode == modeNone && m.detail.detail != nil && m.detail.detail.PipelineID > 0 {
 				m.pipeReturn = viewDetail
-				m.pipeline = newPipelineModel(m.client, m.detail.projectPath, m.detail.detail.PipelineID, m.detail.iid)
+				m.pipeline = newPipelineModel(m.client, m.detail.repo, m.detail.detail.PipelineID, m.detail.id)
 				m.view = viewPipeline
 				var szCmd tea.Cmd
 				m.pipeline, szCmd = m.pipeline.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
@@ -495,7 +496,7 @@ func (m rootModel) updatePipeline(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "enter":
 			if job, ok := m.pipeline.selectedJob(); ok {
-				m.jobLog = newJobLogModel(m.client, m.pipeline.projectPath, job)
+				m.jobLog = newJobLogModel(m.client, m.pipeline.repo, job)
 				m.view = viewJobLog
 				var szCmd tea.Cmd
 				m.jobLog, szCmd = m.jobLog.Update(tea.WindowSizeMsg{Width: m.width, Height: m.height})
@@ -551,7 +552,7 @@ func (m rootModel) updateDiff(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m rootModel) View() string {
 	if m.showHelp {
-		return renderHelpOverlay(m.view, m.width, m.height)
+		return renderHelpOverlay(m.view, m.vocab, m.client.Capabilities(), m.width, m.height)
 	}
 	var body string
 	switch m.view {
@@ -593,7 +594,7 @@ func (m rootModel) View() string {
 }
 
 // Run starts the full-screen Bubble Tea program.
-func Run(client *gitlab.Client) error {
+func Run(client forge.Forge) error {
 	p := tea.NewProgram(New(client), tea.WithAltScreen())
 	_, err := p.Run()
 	return err

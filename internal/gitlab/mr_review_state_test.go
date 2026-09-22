@@ -3,6 +3,8 @@ package gitlab
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/hamkens/glx/internal/forge"
 )
 
 func TestMRConnectionCapturesCurrentReviewerState(t *testing.T) {
@@ -25,10 +27,10 @@ func TestMRConnectionCapturesCurrentReviewerState(t *testing.T) {
 	}
 
 	page := connection.toPage("me")
-	if len(page.MRs) != 1 {
-		t.Fatalf("MR count = %d, want 1", len(page.MRs))
+	if len(page.Changes) != 1 {
+		t.Fatalf("change count = %d, want 1", len(page.Changes))
 	}
-	if got := page.MRs[0].ReviewState; got != "REQUESTED" {
-		t.Fatalf("ReviewState = %q, want REQUESTED", got)
+	if got := page.Changes[0].ReviewState; got != forge.ReviewStateRequested {
+		t.Fatalf("ReviewState = %q, want %q", got, forge.ReviewStateRequested)
 	}
 }
