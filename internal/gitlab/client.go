@@ -1,5 +1,5 @@
-// Package gitlab wraps the GitLab API behind a small interface that the TUI
-// consumes. It exposes two backends:
+// Package gitlab implements forge.Forge for a GitLab instance. It exposes two
+// backends:
 //
 //   - REST  (xanzy/go-gitlab): writes (approve/merge/comment) and diff payloads,
 //     where the endpoints are stable and well documented.
@@ -18,12 +18,13 @@ import (
 	gogitlab "github.com/xanzy/go-gitlab"
 
 	"github.com/hamkens/glx/internal/cache"
+	"github.com/hamkens/glx/internal/forge"
 )
 
 // cacheTTL is how long read results stay fresh before a background refetch.
 const cacheTTL = 30 * time.Second
 
-// Client is the dual-backend GitLab client used throughout glx.
+// Client is the dual-backend GitLab client. It implements forge.Forge.
 type Client struct {
 	host     string
 	token    string
@@ -34,10 +35,13 @@ type Client struct {
 	restURL  string
 
 	// Per-read-type TTL caches keep the TUI snappy on view re-entry.
-	mrListCache   *cache.Cache[string, *MRPage]
-	mrDetailCache *cache.Cache[string, *MRDetail]
-	mrDiffCache   *cache.Cache[string, *MRDiff]
+	mrListCache   *cache.Cache[string, *forge.ChangePage]
+	mrDetailCache *cache.Cache[string, *forge.ChangeDetail]
+	mrDiffCache   *cache.Cache[string, *forge.Diff]
 }
+
+// Compile-time check that the client satisfies the provider-neutral contract.
+var _ forge.Forge = (*Client)(nil)
 
 // New constructs a Client for the given host and token.
 func New(host, token string) (*Client, error) {
@@ -53,24 +57,24 @@ func New(host, token string) (*Client, error) {
 		http:          &http.Client{Timeout: 30 * time.Second},
 		gqlURL:        fmt.Sprintf("https://%s/api/graphql", host),
 		restURL:       baseURL,
-		mrListCache:   cache.New[string, *MRPage](cacheTTL),
-		mrDetailCache: cache.New[string, *MRDetail](cacheTTL),
-		mrDiffCache:   cache.New[string, *MRDiff](cacheTTL),
+		mrListCache:   cache.New[string, *forge.ChangePage](cacheTTL),
+		mrDetailCache: cache.New[string, *forge.ChangeDetail](cacheTTL),
+		mrDiffCache:   cache.New[string, *forge.Diff](cacheTTL),
 	}, nil
 }
 
-// forceRefreshKey marks a context as bypassing (and refilling) the cache.
-type forceRefreshKey struct{}
+// Provider identifies this backend.
+func (c *Client) Provider() forge.Provider { return forge.ProviderGitLab }
 
-// WithForceRefresh returns a context that bypasses cached reads, so the next
-// read hits the API and repopulates the cache. Used by the "r" refresh key.
-func WithForceRefresh(ctx context.Context) context.Context {
-	return context.WithValue(ctx, forceRefreshKey{}, true)
-}
-
-func forced(ctx context.Context) bool {
-	v, _ := ctx.Value(forceRefreshKey{}).(bool)
-	return v
+// Capabilities reports what this backend supports. GitLab supports the full
+// action set glx exposes.
+func (c *Client) Capabilities() forge.Capabilities {
+	return forge.Capabilities{
+		AutoMerge:          true,
+		Unapprove:          true,
+		CancelJobIsRunWide: false,
+		DraftToggle:        true,
+	}
 }
 
 // CurrentUser identifies the authenticated account and the instance version.
@@ -92,7 +96,7 @@ func (c *Client) CurrentUser(ctx context.Context) (username, version string, err
 		return "", "", fmt.Errorf("authenticated request returned no user (token invalid or lacks api scope)")
 	}
 	c.username = resp.CurrentUser.Username
-	return resp.CurrentUser.Username, resp.Metadata.Version, nil
+	return resp.CurrentUser.Username, "GitLab " + resp.Metadata.Version, nil
 }
 
 // Username returns the authenticated user's username, or "" if CurrentUser has
@@ -101,3 +105,8 @@ func (c *Client) Username() string { return c.username }
 
 // Host returns the configured GitLab host.
 func (c *Client) Host() string { return c.host }
+
+// DiffURL is the web URL for a merge request's diffs tab.
+func (c *Client) DiffURL(projectPath, iid string) string {
+	return fmt.Sprintf("https://%s/%s/-/merge_requests/%s/diffs", c.host, projectPath, iid)
+}

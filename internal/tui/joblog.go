@@ -11,23 +11,23 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/hamkens/glx/internal/gitlab"
+	"github.com/hamkens/glx/internal/forge"
 )
 
 // --- messages ---
 
 type jobTraceMsg struct {
-	jobID int
+	jobID int64
 	trace string
 	err   error
 }
 
-// jobLogModel shows a single job's trace in a scrollable viewport. GitLab's
-// trace already carries ANSI color codes, which the terminal renders directly.
+// jobLogModel shows a single job's log in a scrollable viewport. Both providers
+// return logs carrying ANSI color codes, which the terminal renders directly.
 type jobLogModel struct {
-	client      *gitlab.Client
-	projectPath string
-	job         gitlab.Job
+	client forge.Forge
+	repo   string
+	job    forge.Job
 
 	vp      viewport.Model
 	spinner spinner.Model
@@ -40,25 +40,25 @@ type jobLogModel struct {
 	height int
 }
 
-func newJobLogModel(client *gitlab.Client, projectPath string, job gitlab.Job) jobLogModel {
+func newJobLogModel(client forge.Forge, repo string, job forge.Job) jobLogModel {
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	return jobLogModel{
-		client:      client,
-		projectPath: projectPath,
-		job:         job,
-		spinner:     sp,
-		loading:     true,
-		tail:        job.Status == "running",
+		client:  client,
+		repo:    repo,
+		job:     job,
+		spinner: sp,
+		loading: true,
+		tail:    job.Status == forge.StatusRunning,
 	}
 }
 
 func (m jobLogModel) fetchCmd() tea.Cmd {
-	client, path, jobID := m.client, m.projectPath, m.job.ID
+	client, repo, jobID := m.client, m.repo, m.job.ID
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		defer cancel()
-		tr, err := client.JobTrace(ctx, path, jobID)
+		tr, err := client.JobLog(ctx, repo, jobID)
 		return jobTraceMsg{jobID: jobID, trace: tr, err: err}
 	}
 }
@@ -144,7 +144,7 @@ func (m jobLogModel) View() string {
 }
 
 func (m jobLogModel) header() string {
-	title := titleStyle.Render(m.job.Name) + "  " + jobGlyph(m.job.Status) + " " + helpStyle.Render(m.job.Status)
+	title := titleStyle.Render(m.job.Name) + "  " + statusGlyph(m.job.Status) + " " + helpStyle.Render(m.job.Status.String())
 	scroll := helpStyle.Render(fmt.Sprintf("%3.0f%%", m.vp.ScrollPercent()*100))
 	tail := ""
 	if m.tail {

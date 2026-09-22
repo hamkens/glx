@@ -3,54 +3,15 @@ package gitlab
 import (
 	"context"
 	"time"
+
+	"github.com/hamkens/glx/internal/forge"
 )
 
-// Note is a single comment within a discussion thread.
-type Note struct {
-	Author    string
-	Body      string
-	System    bool // GitLab-generated (e.g. "approved this merge request")
-	CreatedAt string
-}
-
-// Discussion is a thread of notes.
-type Discussion struct {
-	ID         string
-	Resolvable bool
-	Resolved   bool
-	Notes      []Note
-}
-
-// MRDetail is the full view of a single merge request.
-type MRDetail struct {
-	IID               string
-	Title             string
-	Draft             bool   // work-in-progress
-	State             string // opened / merged / closed
-	MergeStatus       string // CAN_BE_MERGED, etc. (coarse mergeStatusEnum)
-	DetailedStatus    string // detailedMergeStatus, e.g. MERGEABLE, NEED_REBASE
-	ShouldBeRebased   bool   // source branch is behind target; needs rebase
-	Description       string // raw markdown
-	WebURL            string
-	SourceBranch      string
-	TargetBranch      string
-	Author            string
-	Pipeline          string
-	PipelineLabel     string
-	PipelineID        int // head pipeline numeric ID, 0 if none
-	Approved          bool
-	ApprovedByMe      bool // the authenticated user is among the approvers
-	ApprovalsRequired int
-	ApprovalsLeft     int
-	ApprovedBy        []string
-	Discussions       []Discussion
-}
-
-// MergeRequestDetail fetches the full detail for one MR via GraphQL.
-// Results are cached (TTL); pass a WithForceRefresh context to skip the cache.
-func (c *Client) MergeRequestDetail(ctx context.Context, projectPath, iid string) (*MRDetail, error) {
+// ChangeDetail fetches the full detail for one MR via GraphQL. Results are
+// cached (TTL); pass a forge.WithForceRefresh context to skip the cache.
+func (c *Client) ChangeDetail(ctx context.Context, projectPath, iid string) (*forge.ChangeDetail, error) {
 	cacheKey := projectPath + "!" + iid
-	if !forced(ctx) {
+	if !forge.Forced(ctx) {
 		if d, ok := c.mrDetailCache.Get(cacheKey, time.Now()); ok {
 			return d, nil
 		}
@@ -135,17 +96,17 @@ func (c *Client) MergeRequestDetail(ctx context.Context, projectPath, iid string
 	}
 	mr := resp.Project.MergeRequest
 	if mr == nil {
-		return nil, &NotFoundError{Resource: "merge request", ID: projectPath + "!" + iid}
+		return nil, &forge.NotFoundError{Resource: "merge request", ID: projectPath + "!" + iid}
 	}
 
-	d := &MRDetail{
-		IID:               mr.IID,
+	d := &forge.ChangeDetail{
+		ID:                mr.IID,
+		Repo:              projectPath,
 		Title:             mr.Title,
 		Draft:             mr.Draft,
-		State:             mr.State,
-		MergeStatus:       mr.MergeStatusEnum,
-		DetailedStatus:    mr.DetailedMergeStatus,
-		ShouldBeRebased:   mr.ShouldBeRebased,
+		State:             forge.ParseGitLabState(mr.State),
+		MergeState:        mergeState(mr.DetailedMergeStatus, mr.MergeStatusEnum),
+		NeedsUpdate:       mr.ShouldBeRebased,
 		Description:       mr.Description,
 		WebURL:            mr.WebURL,
 		SourceBranch:      mr.SourceBranch,
@@ -156,7 +117,7 @@ func (c *Client) MergeRequestDetail(ctx context.Context, projectPath, iid string
 		ApprovalsLeft:     mr.ApprovalsLeft,
 	}
 	if mr.HeadPipeline != nil {
-		d.Pipeline = mr.HeadPipeline.Status
+		d.Pipeline = forge.ParseGitLabStatus(mr.HeadPipeline.Status)
 		d.PipelineLabel = mr.HeadPipeline.DetailedStatus.Label
 		d.PipelineID = parseGID(mr.HeadPipeline.ID)
 	}
@@ -167,9 +128,9 @@ func (c *Client) MergeRequestDetail(ctx context.Context, projectPath, iid string
 		}
 	}
 	for _, disc := range mr.Discussions.Nodes {
-		dd := Discussion{ID: disc.ID, Resolvable: disc.Resolvable, Resolved: disc.Resolved}
+		dd := forge.Discussion{ID: disc.ID, Resolvable: disc.Resolvable, Resolved: disc.Resolved}
 		for _, n := range disc.Notes.Nodes {
-			dd.Notes = append(dd.Notes, Note{
+			dd.Notes = append(dd.Notes, forge.Note{
 				Author:    n.Author.Username,
 				Body:      n.Body,
 				System:    n.System,
@@ -183,12 +144,21 @@ func (c *Client) MergeRequestDetail(ctx context.Context, projectPath, iid string
 	return d, nil
 }
 
-// NotFoundError indicates a requested resource does not exist or is not visible.
-type NotFoundError struct {
-	Resource string
-	ID       string
-}
-
-func (e *NotFoundError) Error() string {
-	return e.Resource + " not found: " + e.ID
+// mergeState prefers GitLab's detailedMergeStatus, which distinguishes states
+// like NEED_REBASE, and falls back to the coarse mergeStatusEnum when the
+// instance is too old to report the detailed one.
+func mergeState(detailed, coarse string) forge.MergeState {
+	if s := forge.ParseGitLabMergeState(detailed); s != forge.MergeStateUnknown {
+		return s
+	}
+	switch coarse {
+	case "CAN_BE_MERGED", "MERGEABLE":
+		return forge.MergeStateMergeable
+	case "CANNOT_BE_MERGED", "BROKEN_STATUS":
+		return forge.MergeStateConflict
+	case "CHECKING", "UNCHECKED", "CANNOT_BE_MERGED_RECHECK":
+		return forge.MergeStateChecking
+	default:
+		return forge.MergeStateUnknown
+	}
 }

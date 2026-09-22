@@ -1,6 +1,12 @@
 package tui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"strconv"
+
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/hamkens/glx/internal/forge"
+)
 
 // Shared palette and styles for the glx TUI.
 var (
@@ -23,59 +29,50 @@ var (
 	errStyle = lipgloss.NewStyle().Foreground(colorRed)
 )
 
-// pipelineGlyph maps a GraphQL pipeline status to a colored single-char glyph.
-func pipelineGlyph(status string) string {
-	switch status {
-	case "SUCCESS":
+// statusGlyph maps a normalized CI status to a colored single-char glyph. Both
+// pipeline-level and job-level statuses go through here: the provider-specific
+// spellings are already resolved by the forge layer.
+func statusGlyph(s forge.Status) string {
+	switch s {
+	case forge.StatusSuccess:
 		return lipgloss.NewStyle().Foreground(colorGreen).Render("●")
-	case "FAILED":
+	case forge.StatusFailed:
 		return lipgloss.NewStyle().Foreground(colorRed).Render("✘")
-	case "RUNNING", "PENDING":
+	case forge.StatusRunning:
 		return lipgloss.NewStyle().Foreground(colorYellow).Render("◐")
-	case "CANCELED", "SKIPPED", "MANUAL":
+	case forge.StatusPending:
+		return lipgloss.NewStyle().Foreground(colorYellow).Render("◔")
+	case forge.StatusManual:
+		return lipgloss.NewStyle().Foreground(colorGray).Render("⏻")
+	case forge.StatusCanceled, forge.StatusSkipped:
 		return lipgloss.NewStyle().Foreground(colorGray).Render("○")
-	case "":
+	case forge.StatusNone:
 		return lipgloss.NewStyle().Foreground(colorGray).Render("·")
 	default:
 		return lipgloss.NewStyle().Foreground(colorGray).Render("◌")
 	}
 }
 
-// jobGlyph maps a REST job/pipeline status (lowercase) to a colored glyph.
-func jobGlyph(status string) string {
-	switch status {
-	case "success":
-		return lipgloss.NewStyle().Foreground(colorGreen).Render("●")
-	case "failed":
-		return lipgloss.NewStyle().Foreground(colorRed).Render("✘")
-	case "running":
-		return lipgloss.NewStyle().Foreground(colorYellow).Render("◐")
-	case "pending", "created", "scheduled", "waiting_for_resource", "preparing":
-		return lipgloss.NewStyle().Foreground(colorYellow).Render("◔")
-	case "manual":
-		return lipgloss.NewStyle().Foreground(colorGray).Render("⏻")
-	case "canceled", "skipped":
-		return lipgloss.NewStyle().Foreground(colorGray).Render("○")
-	default:
-		return lipgloss.NewStyle().Foreground(colorGray).Render("◌")
-	}
-}
-
-// mergeStatusTag returns a short colored tag for a detailedMergeStatus value
-// worth flagging in a list row (e.g. needs rebase, blocked). Returns "" for
-// mergeable/benign statuses, which need no tag. "conflict" is handled
-// separately via the dedicated conflicts flag.
-func mergeStatusTag(detailed string) string {
-	switch detailed {
-	case "NEED_REBASE":
-		return lipgloss.NewStyle().Foreground(colorYellow).Render("rebase")
-	case "BLOCKED_STATUS":
-		return lipgloss.NewStyle().Foreground(colorYellow).Render("blocked")
-	case "DISCUSSIONS_NOT_RESOLVED":
-		return lipgloss.NewStyle().Foreground(colorYellow).Render("threads")
+// mergeStateTag returns a short colored tag for a merge state worth flagging in
+// a list row (needs update, blocked, unresolved threads). It returns "" for
+// mergeable and benign states, which need no tag; conflicts are handled
+// separately via the dedicated conflicts flag. Wording follows the provider, so
+// GitLab shows "rebase" where GitHub shows "update".
+func mergeStateTag(s forge.MergeState, v forge.Vocabulary) string {
+	tag := ""
+	switch s {
+	case forge.MergeStateNeedsUpdate:
+		tag = v.UpdateBranch
+	case forge.MergeStateBlocked:
+		tag = "blocked"
+	case forge.MergeStateThreadsUnresolved:
+		tag = v.Threads
+	case forge.MergeStateChangesRequested:
+		tag = "changes"
 	default:
 		return ""
 	}
+	return lipgloss.NewStyle().Foreground(colorYellow).Render(tag)
 }
 
 // approvalGlyph shows approval state compactly:
@@ -91,30 +88,7 @@ func approvalGlyph(approved, approvedByMe bool, left int) string {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Render("✓")
 	}
 	if left > 0 {
-		return lipgloss.NewStyle().Foreground(colorYellow).Render(itoa(left))
+		return lipgloss.NewStyle().Foreground(colorYellow).Render(strconv.Itoa(left))
 	}
 	return lipgloss.NewStyle().Foreground(colorSubtle).Render("-")
-}
-
-// itoa is a tiny strconv.Itoa to avoid an import here.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var b [20]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		b[i] = '-'
-	}
-	return string(b[i:])
 }
