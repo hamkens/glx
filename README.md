@@ -54,20 +54,39 @@ failing with an opaque API error:
 
 ## Install
 
-Requires Go 1.26+.
+Requires Go 1.26.4+ and Make for the commands below.
 
 ```sh
 go install github.com/hamkens/glx/cmd/glx@latest
 ```
 
 This installs the `glx` binary to `$(go env GOPATH)/bin` (ensure it's on your
-`PATH`). Or build from a clone:
+`PATH`, or set `GOBIN` to choose the install directory). To build and run from
+a clone:
 
 ```sh
 git clone https://github.com/hamkens/glx
 cd glx
-go build -o glx ./cmd/glx
+make build
+./glx
 ```
+
+From the project folder, use these commands:
+
+```sh
+make build                       # compile ./glx (also the default for make)
+make run                         # rebuild and launch the TUI
+make run ARGS="--check"           # pass flags to the program
+make install                     # install this checkout's binary on your PATH
+make test                        # run all tests
+make lint                        # run go vet
+make fmt                         # format Go source
+```
+
+`make install` uses `GOBIN` when set, otherwise `$(go env GOPATH)/bin`;
+ensure that directory is on your `PATH`, then run `glx` from any folder.
+Use `TEST_ARGS` to pass Go test flags, for example
+`make test TEST_ARGS="-run TestName"`.
 
 ## Authentication
 
