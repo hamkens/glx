@@ -11,16 +11,17 @@ self-hosted GitLab instances, github.com and GitHub Enterprise. Entry point:
 
 ## Commands
 
-No Makefile; use `go` directly.
+Use the Makefile targets, matching the workflow in `agent-overwatch`.
 
 ```sh
-go build -o glx ./cmd/glx     # build
-go run ./cmd/glx --check      # verify config/auth + connectivity, no TUI
-go run ./cmd/glx              # launch the TUI
-go test ./...                 # run all tests
-go test ./internal/gitlab -run TestName   # run a single test
-go vet ./...
-gofmt -l internal/ cmd/       # list unformatted files (use -w to fix)
+make build                         # build ./glx (default target)
+make run                           # rebuild and launch the TUI
+make run ARGS="--check"             # verify config/auth + connectivity, no TUI
+make install                       # install this checkout via go install
+make test                          # run all tests
+make test TEST_ARGS="-run TestName" # run tests matching a name
+make lint                          # go vet
+make fmt                           # gofmt -w
 ```
 
 ## Architecture
