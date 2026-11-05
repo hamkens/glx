@@ -172,6 +172,15 @@ func TestParseReviewStates(t *testing.T) {
 	}
 }
 
+func TestFeedbackGivenReviewCategory(t *testing.T) {
+	for _, state := range []ReviewState{ReviewStateNone, ReviewStateRequested, ReviewStateReviewed, ReviewStateApproved, ReviewStateChangesRequested} {
+		want := state == ReviewStateReviewed || state == ReviewStateChangesRequested
+		if got := state.FeedbackGiven(); got != want {
+			t.Errorf("state %v: FeedbackGiven = %v, want %v", state, got, want)
+		}
+	}
+}
+
 func TestVocabFallsBackToGitLab(t *testing.T) {
 	if got := Vocab(ProviderGitHub).ChangeAbbrev; got != "PR" {
 		t.Errorf("github abbrev = %q; want PR", got)

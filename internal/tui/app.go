@@ -261,6 +261,11 @@ func (m rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
+	case mrsLoadedMsg, mergedLoadedMsg, scopeSummaryLoadedMsg, mrsErrMsg:
+		// List pagination and summaries continue while a change is open.
+		var cmd tea.Cmd
+		m.mrList, cmd = m.mrList.Update(msg)
+		return m, cmd
 	case watchTickMsg:
 		m.watching = false
 		if m.watch.HasActive() {

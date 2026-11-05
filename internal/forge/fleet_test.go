@@ -170,9 +170,9 @@ func TestFleetChangesMergesAndSortsByUpdated(t *testing.T) {
 			t.Errorf("change %s has no Host stamped", c.ID)
 		}
 	}
-	// A merged list has no single cursor to page with.
+	// Both hosts have exhausted their results.
 	if page.HasNextPage {
-		t.Error("HasNextPage = true; a merged list cannot paginate coherently")
+		t.Error("HasNextPage = true; both hosts are exhausted")
 	}
 }
 

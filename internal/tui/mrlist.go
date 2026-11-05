@@ -45,15 +45,17 @@ const mergedWindow = 12 * time.Hour
 // --- messages ---
 
 type mrsLoadedMsg struct {
-	scope  forge.Scope
-	page   *forge.ChangePage
-	append bool // true when this is a "load more" page to append
+	scope      forge.Scope
+	generation uint64
+	page       *forge.ChangePage
+	append     bool // true when this is a "load more" page to append
 }
 
 // mergedLoadedMsg carries the recently-merged changes for a scope.
 type mergedLoadedMsg struct {
-	scope forge.Scope
-	mrs   []forge.Change
+	scope      forge.Scope
+	generation uint64
+	mrs        []forge.Change
 }
 
 // scopeSummaryLoadedMsg carries the complete open workload for a scope. It is
@@ -62,7 +64,11 @@ type scopeSummaryLoadedMsg struct {
 	scope forge.Scope
 	mrs   []forge.Change
 }
-type mrsErrMsg struct{ err error }
+type mrsErrMsg struct {
+	scope      forge.Scope
+	generation uint64
+	err        error
+}
 
 type scopeSummary struct {
 	pending int
@@ -92,6 +98,9 @@ type mrListModel struct {
 	caps        forge.Capabilities
 	spinner     spinner.Model
 	filterInput textinput.Model
+	filters     [3]listFilter
+	filterDraft listFilter
+	filterFocus int
 	scopeIdx    int
 
 	mrs    []forge.Change // open changes, in server order
@@ -105,6 +114,7 @@ type mrListModel struct {
 	loadingMore bool
 	cursor      string // EndCursor of the last loaded page
 	hasNext     bool   // more pages available
+	generation  uint64 // invalidates in-flight loads on refresh or tab changes
 	err         error
 	flash       string    // transient action result/status
 	confirm     inputMode // modeConfirmMerge / modeConfirmAutoMerge, else modeNone
@@ -119,7 +129,7 @@ func newMRListModel(client forge.Forge) mrListModel {
 	sp.Spinner = spinner.Dot
 
 	ti := textinput.New()
-	ti.Prompt = "/"
+	ti.Prompt = "Search: "
 	ti.Placeholder = "filter by title, project, or branch"
 
 	m := mrListModel{
@@ -190,6 +200,7 @@ func (m mrListModel) scopeHasMerged() bool {
 // cache is bypassed (used by the "r" refresh key).
 func (m mrListModel) fetchCmd(force bool) tea.Cmd {
 	scope := m.scope()
+	generation := m.generation
 	client := m.client
 	cmds := []tea.Cmd{func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -199,9 +210,9 @@ func (m mrListModel) fetchCmd(force bool) tea.Cmd {
 		}
 		page, err := client.Changes(ctx, scope, "", pageSize)
 		if err != nil {
-			return mrsErrMsg{err}
+			return mrsErrMsg{scope: scope, generation: generation, err: err}
 		}
-		return mrsLoadedMsg{scope: scope, page: page}
+		return mrsLoadedMsg{scope: scope, generation: generation, page: page}
 	}}
 	if m.scopeHasMerged() {
 		cmds = append(cmds, m.mergedCmd(force))
@@ -212,6 +223,7 @@ func (m mrListModel) fetchCmd(force bool) tea.Cmd {
 // mergedCmd loads changes merged within mergedWindow for the current scope.
 func (m mrListModel) mergedCmd(force bool) tea.Cmd {
 	scope := m.scope()
+	generation := m.generation
 	client := m.client
 	since := time.Now().Add(-mergedWindow).UTC().Format(time.RFC3339)
 	return func() tea.Msg {
@@ -222,15 +234,16 @@ func (m mrListModel) mergedCmd(force bool) tea.Cmd {
 		}
 		mrs, err := client.MergedSince(ctx, scope, since, 50)
 		if err != nil {
-			return mrsErrMsg{err}
+			return mrsErrMsg{scope: scope, generation: generation, err: err}
 		}
-		return mergedLoadedMsg{scope: scope, mrs: mrs}
+		return mergedLoadedMsg{scope: scope, generation: generation, mrs: mrs}
 	}
 }
 
 // loadMoreCmd fetches the next page (after cursor) to append to the list.
 func (m mrListModel) loadMoreCmd() tea.Cmd {
 	scope := m.scope()
+	generation := m.generation
 	client := m.client
 	cursor := m.cursor
 	return func() tea.Msg {
@@ -238,9 +251,9 @@ func (m mrListModel) loadMoreCmd() tea.Cmd {
 		defer cancel()
 		page, err := client.Changes(ctx, scope, cursor, pageSize)
 		if err != nil {
-			return mrsErrMsg{err}
+			return mrsErrMsg{scope: scope, generation: generation, err: err}
 		}
-		return mrsLoadedMsg{scope: scope, page: page, append: true}
+		return mrsLoadedMsg{scope: scope, generation: generation, page: page, append: true}
 	}
 }
 
@@ -391,15 +404,13 @@ func listAutoMergeBlock(mr forge.Change, v forge.Vocabulary) string {
 
 // applyFilter returns the changes matching the current filter query.
 func (m mrListModel) applyFilter(mrs []forge.Change) []forge.Change {
-	q := strings.ToLower(strings.TrimSpace(m.filterInput.Value()))
-	if q == "" {
+	f := m.filters[m.scopeIdx]
+	if !f.active() {
 		return mrs
 	}
-	terms := strings.Fields(q)
 	var out []forge.Change
 	for _, mr := range mrs {
-		hay := strings.ToLower(mr.Title + " " + mr.Repo + " " + mr.SourceBranch)
-		if containsAll(hay, terms) {
+		if f.matches(mr) {
 			out = append(out, mr)
 		}
 	}
@@ -447,6 +458,7 @@ func (m *mrListModel) appendGrouped(mrs []forge.Change) {
 // rebuildRows builds the display rows: an "Open" section grouped by project,
 // then (when the scope tracks it) a "Merged" section of recently-merged changes.
 func (m *mrListModel) rebuildRows() {
+	selected, hadSelection := m.selected()
 	m.rows = nil
 
 	open := m.applyFilter(m.mrs)
@@ -468,6 +480,14 @@ func (m *mrListModel) rebuildRows() {
 		m.appendGrouped(merged)
 	}
 
+	if hadSelection {
+		for i, row := range m.rows {
+			if row.selectable() && row.mr.Host == selected.Host && row.mr.Repo == selected.Repo && row.mr.ID == selected.ID {
+				m.cur = i
+				break
+			}
+		}
+	}
 	m.clampCursor()
 }
 
@@ -528,13 +548,18 @@ func (m mrListModel) Update(msg tea.Msg) (mrListModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		m.filterInput.Width = msg.Width - 4
+		m.resizeFilterInput()
 		m.scrollToCursor()
 		return m, nil
 
 	case mrsLoadedMsg:
 		// Ignore stale responses from a scope we've since switched away from.
-		if msg.scope != m.scope() {
+		if msg.scope != m.scope() || msg.generation != m.generation {
+			return m, nil
+		}
+		if msg.page.HasNextPage && (msg.page.EndCursor == "" || (msg.append && msg.page.EndCursor == m.cursor)) {
+			m.loading, m.loadingMore = false, false
+			m.err = fmt.Errorf("pagination did not advance; press r to retry")
 			return m, nil
 		}
 		m.loading = false
@@ -550,10 +575,11 @@ func (m mrListModel) Update(msg tea.Msg) (mrListModel, tea.Cmd) {
 			m.cur, m.scroll = 0, 0
 		}
 		m.rebuildRows()
-		return m, nil
+		cmd := m.maybeLoadMore()
+		return m, cmd
 
 	case mergedLoadedMsg:
-		if msg.scope != m.scope() {
+		if msg.scope != m.scope() || msg.generation != m.generation {
 			return m, nil
 		}
 		m.merged = msg.mrs
@@ -575,9 +601,13 @@ func (m mrListModel) Update(msg tea.Msg) (mrListModel, tea.Cmd) {
 		}
 		m.flash = lipgloss.NewStyle().Foreground(colorGreen).Render("✓ " + msg.verb)
 		// Refresh to reflect the new state (caches were invalidated server-side).
+		m.resetPaging()
 		return m, tea.Batch(m.spinner.Tick, m.fetchCmd(true), m.summaryCmd(m.scope(), true))
 
 	case mrsErrMsg:
+		if msg.scope != m.scope() || msg.generation != m.generation {
+			return m, nil
+		}
 		m.loading = false
 		m.loadingMore = false
 		m.err = msg.err
@@ -591,28 +621,18 @@ func (m mrListModel) Update(msg tea.Msg) (mrListModel, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
+	if m.filterMode && m.filterFocus == 0 {
+		var cmd tea.Cmd
+		m.filterInput, cmd = m.filterInput.Update(msg)
+		return m, cmd
+	}
 	return m, nil
 }
 
 func (m mrListModel) handleKey(msg tea.KeyMsg) (mrListModel, tea.Cmd) {
 	// Filter input owns keys while active.
 	if m.filterMode {
-		switch msg.String() {
-		case "esc":
-			m.filterMode = false
-			m.filterInput.SetValue("")
-			m.filterInput.Blur()
-			m.rebuildRows()
-			return m, nil
-		case "enter":
-			m.filterMode = false
-			m.filterInput.Blur()
-			return m, nil
-		}
-		var cmd tea.Cmd
-		m.filterInput, cmd = m.filterInput.Update(msg)
-		m.rebuildRows()
-		return m, cmd
+		return m.handleFilterKey(msg)
 	}
 
 	// Merge / auto-merge confirmation owns y/N.
@@ -651,9 +671,10 @@ func (m mrListModel) handleKey(msg tea.KeyMsg) (mrListModel, tea.Cmd) {
 		m.resetPaging()
 		return m, tea.Batch(m.spinner.Tick, m.fetchCmd(true), m.summaryCmd(m.scope(), true))
 	case "/":
-		m.filterMode = true
-		m.filterInput.Focus()
-		return m, textinput.Blink
+		return m.openFilters()
+	case "esc":
+		m.filters[m.scopeIdx] = listFilter{}
+		m.rebuildRows()
 	case "down", "j":
 		m.moveCursor(1)
 	case "up", "k":
@@ -741,12 +762,13 @@ func (m mrListModel) halfPage() int {
 
 // resetPaging clears the list and pagination state before a fresh load.
 func (m *mrListModel) resetPaging() {
+	m.generation++
+	m.err = nil
 	m.loading = true
 	m.loadingMore = false
 	m.cursor = ""
 	m.hasNext = false
 	m.filterMode = false
-	m.filterInput.SetValue("")
 	m.filterInput.Blur()
 	m.mrs = nil
 	m.merged = nil
@@ -755,17 +777,17 @@ func (m *mrListModel) resetPaging() {
 }
 
 // maybeLoadMore returns a command to fetch the next page when the cursor is
-// within a few rows of the end and more pages exist. Filtering is excluded so
-// we don't paginate while the user narrows the current set.
+// within a few rows of the end and more pages exist. Active filters drain all
+// remaining pages so a sparse or empty result never hides later matches.
 func (m *mrListModel) maybeLoadMore() tea.Cmd {
 	const threshold = 5
 	if !m.hasNext || m.loadingMore || m.loading {
 		return nil
 	}
-	if m.filterInput.Value() != "" {
+	if m.err != nil {
 		return nil
 	}
-	if m.cur < len(m.rows)-threshold {
+	if !m.filters[m.scopeIdx].active() && m.cur < len(m.rows)-threshold {
 		return nil
 	}
 	m.loadingMore = true
@@ -779,12 +801,17 @@ func (m mrListModel) View() string {
 		body = fmt.Sprintf("\n  %s loading %s…", m.spinner.View(), m.vocab.Changes)
 	case m.err != nil:
 		body = "\n  " + errStyle.Render("error: "+m.err.Error())
-	case len(m.rows) == 0 && m.filterInput.Value() != "":
+	case len(m.rows) == 0 && m.loadingMore:
+		body = "\n  " + helpStyle.Render("searching more "+m.vocab.Changes+"…")
+	case len(m.rows) == 0 && m.filters[m.scopeIdx].active():
 		body = "\n  " + helpStyle.Render("no "+m.vocab.Changes+" match the filter")
 	case len(m.rows) == 0:
 		body = "\n  " + helpStyle.Render("no open "+m.vocab.Changes+" in this scope")
 	default:
 		body = m.rowsView()
+	}
+	if m.filterMode {
+		body = m.filterView()
 	}
 
 	// Pad the body so it fills the available height and the bottom line stays
@@ -869,6 +896,9 @@ func (m mrListModel) renderRow(i int, activeProject string) string {
 
 	flags := ""
 	if !merged {
+		if mr.ReviewState.FeedbackGiven() {
+			flags += helpStyle.Render(" reviewed")
+		}
 		if mr.Draft {
 			flags += lipgloss.NewStyle().Foreground(colorSubtle).Render(" draft")
 		}
@@ -931,7 +961,11 @@ func (m mrListModel) statusBar() string {
 	}
 	left := strings.Join(tabs, helpStyle.Render(" · "))
 	if m.loadingMore {
-		left += "  " + helpStyle.Render(m.spinner.View()+" more")
+		label := "more"
+		if m.filters[m.scopeIdx].active() {
+			label = "searching"
+		}
+		left += "  " + helpStyle.Render(m.spinner.View()+" "+label)
 	}
 
 	right := helpStyle.Render(m.client.Host())
@@ -1090,16 +1124,16 @@ func (m mrListModel) bottomLine() string {
 		return errStyle.Render("  set auto-merge (merge when checks pass)? [y/N]")
 	}
 	if m.filterMode {
-		return "  " + m.filterInput.View()
+		return helpStyle.Render("  Filters apply to " + scopeOrder[m.scopeIdx].label + " only")
 	}
 	if m.flash != "" {
 		return "  " + m.flash
 	}
-	if q := m.filterInput.Value(); q != "" {
-		return helpStyle.Render("  filter: ") + lipgloss.NewStyle().Foreground(colorAccent).Render(q) +
-			helpStyle.Render("  (esc to clear)")
+	if f := m.filters[m.scopeIdx]; f.active() {
+		return truncateToWidth(helpStyle.Render("  "+m.filterCount()+" · Filters: ")+
+			titleStyle.Render(f.summary())+helpStyle.Render(" · / edit · esc clear"), m.width)
 	}
-	return helpStyle.Render(fmt.Sprintf("  enter open · a/M/A/b act · d diff · p %s · / filter · ? help", m.vocab.Pipeline))
+	return truncateToWidth(helpStyle.Render(fmt.Sprintf("  %s · enter open · a/M/A/b act · d diff · p %s · / filters · ? help", m.filterCount(), m.vocab.Pipeline)), m.width)
 }
 
 func nowHM() string {
