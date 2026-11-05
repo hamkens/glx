@@ -95,6 +95,29 @@ func TestPRNodeViewerApprovalWins(t *testing.T) {
 	}
 }
 
+func TestPRReReviewRequestOverridesCompletedFeedback(t *testing.T) {
+	for _, state := range []string{"COMMENTED", "CHANGES_REQUESTED", "APPROVED"} {
+		t.Run(state, func(t *testing.T) {
+			raw := fmt.Sprintf(`{"nodes": [{
+				"number": 42,
+				"latestReviews": {"nodes": [{"state": %q, "author": {"login": "me"}}]},
+				"reviewRequests": {"nodes": [{"requestedReviewer": {"login": "me"}}]}
+			}]}`, state)
+			var conn prConnection
+			if err := json.Unmarshal([]byte(raw), &conn); err != nil {
+				t.Fatal(err)
+			}
+			pr := conn.toPage("me").Changes[0]
+			if !pr.ReviewState.Pending() || pr.ReviewState.FeedbackGiven() {
+				t.Fatalf("active re-review request lost: %+v", pr)
+			}
+			if pr.ApprovedByMe != (state == "APPROVED") {
+				t.Fatal("review request should preserve the recorded approval")
+			}
+		})
+	}
+}
+
 // An empty reviewDecision means the repository requires no review at all, which
 // must not be rendered as "approvals missing".
 func TestPRNodeNoReviewRequirementCountsAsApproved(t *testing.T) {

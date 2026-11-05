@@ -73,9 +73,9 @@ session can show GitLab and GitHub in one list. `cmd/glx/main.go` always wraps
 the clients in one, so the TUI never learns how many hosts are behind it.
 
 - Reads fan out concurrently and merge (`Changes` sorted newest-updated first,
-  `MergedSince` newest-merged first). Pagination collapses: `pageSize` applies
-  per host and `HasNextPage` is always false, because one opaque cursor can't
-  address several hosts.
+  `MergedSince` newest-merged first). `pageSize` applies per host. A fleet
+  cursor maps each host with remaining results to its provider cursor;
+  exhausted hosts are skipped on subsequent pages.
 - Writes and per-change reads route to the owning member, resolved from the
   `Change.Host` the fleet stamps on every row, falling back to a repo→host index
   for call paths that carry only a repo (watch poller, pipeline drill-down). An

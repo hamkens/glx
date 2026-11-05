@@ -18,10 +18,17 @@ GitHub.
 ## Features
 
 - **Change list** grouped by project, across three scopes
-  (Reviews / Authored / Assigned), with live filtering and pagination.
+  (Reviews / Authored / Assigned), with filtering and pagination.
+  - A **filter modal** (`/`) combines text search (title, project, branch)
+    with toggles for drafts, changes approved by you, recently merged changes,
+    and reviews awaiting the author. Each tab remembers its filters for the
+    session, including across refreshes; all changes are included by default.
+    Active filters search all
+    remaining pages, including across connected hosts.
   - Status glyphs at a glance: CI result, approval state (green check =
     approved by *you*, plain check = approved by others), plus `draft`,
-    `conflict`, `rebase`/`update`, `blocked`, `changes` and `threads` flags.
+    `conflict`, `rebase`/`update`, `blocked`, `changes`, `reviewed` and `threads`
+    flags.
   - A **recently-merged** section (last 12h) on the Reviews and Authored tabs.
 - **Detail** view with description (rendered markdown), approvals, comment
   threads, and a CI summary.
@@ -195,7 +202,8 @@ Press `?` at any time for a context-aware keybinding overlay.
 | --- | --- |
 | `enter` | open the change |
 | `←` / `→` (or `tab`) | switch scope |
-| `/` | filter |
+| `/` | open filter modal |
+| `esc` | clear this tab's filters |
 | `↑` / `↓` | move (auto-loads more) |
 | `a` | approve / unapprove |
 | `M` | merge now (confirm) |
@@ -204,6 +212,19 @@ Press `?` at any time for a context-aware keybinding overlay.
 | `D` | toggle draft / ready |
 | `d` | open diff |
 | `p` | open pipeline |
+
+In the filter modal, type in **Search**, use `tab` / `shift+tab` (or `↑` / `↓`)
+to move between controls, and `space` to toggle a checkbox. `enter` applies;
+`esc` discards edits. Activate **Reset** with `space` or `enter` to restore all
+inclusions and clear the text, then `enter` to apply. Recently merged is only
+offered in Reviews and Authored. The list footer shows active filters and the
+number shown versus loaded; “searching” indicates more pages are being read.
+
+Uncheck **Include awaiting author** to hide changes where you have commented
+or requested changes, without approving. These have a `reviewed` flag in the
+list. This category follows your recorded review state; it does not infer tasks
+from comment text. A new request for your review returns the change to the
+pending queue. It works independently of the drafts and approved-by-you filters.
 
 **Detail** — `a` approve, `M` merge, `A` auto-merge, `b` rebase / update branch,
 `D` draft toggle, `c` comment, `d` diff, `p` pipeline, `esc`/`⌫` back.

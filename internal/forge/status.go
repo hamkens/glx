@@ -365,6 +365,12 @@ func (r ReviewState) String() string {
 // Pending reports whether the user still owes a review.
 func (r ReviewState) Pending() bool { return r == ReviewStateRequested }
 
+// FeedbackGiven reports comments or requested changes without an approval or
+// a subsequent review request. This is the "awaiting author" review category.
+func (r ReviewState) FeedbackGiven() bool {
+	return r == ReviewStateReviewed || r == ReviewStateChangesRequested
+}
+
 // ParseGitLabReviewState normalizes GitLab's reviewState enum.
 func ParseGitLabReviewState(s string) ReviewState {
 	switch strings.ToUpper(strings.TrimSpace(s)) {

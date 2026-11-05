@@ -2,6 +2,7 @@ package forge
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -270,9 +271,13 @@ func (f *Fleet) CapsFor(c Change) Capabilities {
 // and returns the results of the members that succeeded. A member's failure is
 // isolated: the others' results still come back.
 func (f *Fleet) fanOut(fn func(Forge) ([]Change, error)) []Change {
-	perHost := make([][]Change, len(f.members))
+	return f.fanOutMembers(f.members, fn)
+}
+
+func (f *Fleet) fanOutMembers(members []Forge, fn func(Forge) ([]Change, error)) []Change {
+	perHost := make([][]Change, len(members))
 	var wg sync.WaitGroup
-	for i, m := range f.members {
+	for i, m := range members {
 		wg.Add(1)
 		go func(i int, m Forge) {
 			defer wg.Done()
@@ -299,12 +304,9 @@ func (f *Fleet) fanOut(fn func(Forge) ([]Change, error)) []Change {
 	return out
 }
 
-// Changes merges one page from every host. Pagination collapses: each host is
-// asked for a full page and the union is returned with HasNextPage false, since
-// a single opaque cursor cannot address several hosts at once. pageSize is
-// applied per host, so a 2-host fleet returns up to 2×pageSize rows — the point
-// of the merged list is seeing the whole workload, and the summary pass already
-// walks every page anyway.
+// Changes merges one page from each host that still has results. The opaque
+// fleet cursor maps host names to their next provider cursor; exhausted hosts
+// are omitted. pageSize applies per host.
 func (f *Fleet) Changes(ctx context.Context, scope Scope, cursor string, pageSize int) (*ChangePage, error) {
 	if m, ok := f.Single(); ok {
 		page, err := m.Changes(ctx, scope, cursor, pageSize)
@@ -315,15 +317,33 @@ func (f *Fleet) Changes(ctx context.Context, scope Scope, cursor string, pageSiz
 		f.stampSingle(m, page.Changes)
 		return page, nil
 	}
-	// A non-empty cursor means "next page", which the merged list has none of.
+	cursors := make(map[string]string)
 	if cursor != "" {
-		return &ChangePage{}, nil
+		if err := json.Unmarshal([]byte(cursor), &cursors); err != nil {
+			return nil, fmt.Errorf("invalid fleet cursor: %w", err)
+		}
 	}
-
-	changes := f.fanOut(func(m Forge) ([]Change, error) {
-		page, err := m.Changes(ctx, scope, "", pageSize)
+	var pending []Forge
+	for _, m := range f.members {
+		if _, ok := cursors[m.Host()]; cursor == "" || ok {
+			pending = append(pending, m)
+		}
+	}
+	var nextMu sync.Mutex
+	next := make(map[string]string)
+	changes := f.fanOutMembers(pending, func(m Forge) ([]Change, error) {
+		after := cursors[m.Host()]
+		page, err := m.Changes(ctx, scope, after, pageSize)
 		if err != nil {
 			return nil, err
+		}
+		if page.HasNextPage {
+			if page.EndCursor == "" || page.EndCursor == after {
+				return nil, fmt.Errorf("pagination did not advance for %s", m.Host())
+			}
+			nextMu.Lock()
+			next[m.Host()] = page.EndCursor
+			nextMu.Unlock()
 		}
 		return page.Changes, nil
 	})
@@ -333,7 +353,15 @@ func (f *Fleet) Changes(ctx context.Context, scope Scope, cursor string, pageSiz
 		}
 	}
 	sortByUpdated(changes)
-	return &ChangePage{Changes: changes}, nil
+	page := &ChangePage{Changes: changes, HasNextPage: len(next) > 0}
+	if page.HasNextPage {
+		encoded, err := json.Marshal(next)
+		if err != nil {
+			return nil, fmt.Errorf("encode fleet cursor: %w", err)
+		}
+		page.EndCursor = string(encoded)
+	}
+	return page, nil
 }
 
 // MergedSince merges the recently-merged sets, newest merge first.

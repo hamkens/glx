@@ -317,7 +317,8 @@ func (n prNode) toChange(me string) forge.Change {
 		approvedByMe = myReview == forge.ReviewStateApproved
 		break
 	}
-	if myReview == forge.ReviewStateNone && me != "" {
+	// An active request also covers re-review after comments or requested changes.
+	if me != "" {
 		for _, r := range n.ReviewRequests.Nodes {
 			if r.RequestedReviewer.Login == me {
 				myReview = forge.ReviewStateRequested

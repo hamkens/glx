@@ -134,9 +134,17 @@ func helpSections(v view, vocab forge.Vocabulary, caps forge.Capabilities) []hel
 			{changeTitle + " list", []keyHelp{
 				{"enter", "open " + vocab.Change},
 				{"←/→ or tab", "switch scope"},
-				{"/", "filter"},
+				{"/", "open filters (text, drafts, approvals, merged, awaiting author)"},
+				{"esc", "clear filters in this tab"},
 				{"↑/↓", "move (auto-loads more)"},
 				{"pgup / pgdown", "half-page in Reviews / Authored"},
+			}},
+			{"Filter modal", []keyHelp{
+				{"tab / shift+tab", "next / previous control (or ↑/↓)"},
+				{"space", "toggle inclusion / activate Reset"},
+				{"enter", "apply filters / activate Reset"},
+				{"esc", "discard edits and close"},
+				{"awaiting author", "you left feedback; no new review request"},
 			}},
 			{"Actions on selected " + vocab.ChangeAbbrev, append(changeActionKeys(vocab, caps),
 				keyHelp{"d", "open diff"},
@@ -158,6 +166,7 @@ func helpSections(v view, vocab forge.Vocabulary, caps forge.Capabilities) []hel
 				{approvalGlyph(false, false, 0), "none required"},
 			}},
 			{"Legend — flags", []keyHelp{
+				{helpStyle.Render("reviewed"), "you commented or requested changes (awaiting author)"},
 				{lipgloss.NewStyle().Foreground(colorSubtle).Render("draft"), "work in progress"},
 				{errStyle.Render("conflict"), "merge conflicts"},
 				{mergeStateTag(forge.MergeStateNeedsUpdate, vocab), "behind its target branch"},
