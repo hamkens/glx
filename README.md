@@ -226,6 +226,13 @@ list. This category follows your recorded review state; it does not infer tasks
 from comment text. A new request for your review returns the change to the
 pending queue. It works independently of the drafts and approved-by-you filters.
 
+Select **Ready to merge (or update branch)** to show open changes with no
+known merge blockers, including those that only need a rebase or branch update.
+The filter uses the list's available merge status, approvals, conflict and CI
+information; an unknown merge status means no known blocker.
+Selecting it also turns off **Include drafts** and **Include recently merged**;
+turning either inclusion back on clears the ready-to-merge filter.
+
 **Detail** — `a` approve, `M` merge, `A` auto-merge, `b` rebase / update branch,
 `D` draft toggle, `c` comment, `d` diff, `p` pipeline, `esc`/`⌫` back.
 
