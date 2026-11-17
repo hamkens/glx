@@ -134,7 +134,7 @@ func helpSections(v view, vocab forge.Vocabulary, caps forge.Capabilities) []hel
 			{changeTitle + " list", []keyHelp{
 				{"enter", "open " + vocab.Change},
 				{"←/→ or tab", "switch scope"},
-				{"/", "open filters (text, drafts, approvals, merged, awaiting author)"},
+				{"/", "open filters (text, drafts, approvals, merged, review, merge readiness)"},
 				{"esc", "clear filters in this tab"},
 				{"↑/↓", "move (auto-loads more)"},
 				{"pgup / pgdown", "half-page in Reviews / Authored"},

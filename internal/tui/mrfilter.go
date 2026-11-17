@@ -17,10 +17,11 @@ type listFilter struct {
 	hideApprovedMe     bool
 	hideMerged         bool
 	hideAwaitingAuthor bool
+	readyOnly          bool
 }
 
 func (f listFilter) active() bool {
-	return strings.TrimSpace(f.query) != "" || f.hideDrafts || f.hideApprovedMe || f.hideMerged || f.hideAwaitingAuthor
+	return strings.TrimSpace(f.query) != "" || f.hideDrafts || f.hideApprovedMe || f.hideMerged || f.hideAwaitingAuthor || f.readyOnly
 }
 
 func (f listFilter) matches(mr forge.Change) bool {
@@ -28,6 +29,9 @@ func (f listFilter) matches(mr forge.Change) bool {
 		return false
 	}
 	if f.hideAwaitingAuthor && mr.ReviewState.FeedbackGiven() {
+		return false
+	}
+	if f.readyOnly && !readyIncludingUpdate(mr) {
 		return false
 	}
 	hay := strings.ToLower(mr.Title + " " + mr.Repo + " " + mr.SourceBranch)
@@ -50,6 +54,9 @@ func (f listFilter) summary() string {
 	}
 	if f.hideAwaitingAuthor {
 		parts = append(parts, "not awaiting author")
+	}
+	if f.readyOnly {
+		parts = append(parts, "ready to merge")
 	}
 	return strings.Join(parts, " · ")
 }
@@ -82,7 +89,9 @@ func (m mrListModel) filterAwaitingAuthorIndex() int {
 	return 3
 }
 
-func (m mrListModel) filterResetIndex() int { return m.filterAwaitingAuthorIndex() + 1 }
+func (m mrListModel) filterReadyIndex() int { return m.filterAwaitingAuthorIndex() + 1 }
+
+func (m mrListModel) filterResetIndex() int { return m.filterReadyIndex() + 1 }
 
 func (m mrListModel) handleFilterKey(msg tea.KeyMsg) (mrListModel, tea.Cmd) {
 	switch msg.String() {
@@ -123,13 +132,29 @@ func (m mrListModel) handleFilterKey(msg tea.KeyMsg) (mrListModel, tea.Cmd) {
 			m.filterDraft.hideAwaitingAuthor = !m.filterDraft.hideAwaitingAuthor
 			return m, nil
 		}
+		if m.filterFocus == m.filterReadyIndex() {
+			m.filterDraft.readyOnly = !m.filterDraft.readyOnly
+			if m.filterDraft.readyOnly {
+				m.filterDraft.hideDrafts = true
+				if m.scopeHasMerged() {
+					m.filterDraft.hideMerged = true
+				}
+			}
+			return m, nil
+		}
 		switch m.filterFocus {
 		case 1:
 			m.filterDraft.hideDrafts = !m.filterDraft.hideDrafts
+			if !m.filterDraft.hideDrafts {
+				m.filterDraft.readyOnly = false
+			}
 		case 2:
 			m.filterDraft.hideApprovedMe = !m.filterDraft.hideApprovedMe
 		case 3:
 			m.filterDraft.hideMerged = !m.filterDraft.hideMerged
+			if !m.filterDraft.hideMerged {
+				m.filterDraft.readyOnly = false
+			}
 		}
 	}
 	if m.filterFocus == 0 {
@@ -168,11 +193,12 @@ func (m mrListModel) filterView() string {
 		option(3, "Include recently merged", !m.filterDraft.hideMerged)
 	}
 	option(m.filterAwaitingAuthorIndex(), "Include awaiting author", !m.filterDraft.hideAwaitingAuthor)
+	option(m.filterReadyIndex(), "Ready to merge (or update branch)", m.filterDraft.readyOnly)
 	reset := "  Reset"
 	if m.filterFocus == m.filterResetIndex() {
 		reset = titleStyle.Render("› Reset")
 	}
-	lines = append(lines, reset, "", helpStyle.Render("Tab/↑↓ move · Space toggle"), helpStyle.Render("Enter apply · Esc cancel"))
+	lines = append(lines, reset, helpStyle.Render("Tab/↑↓ move · Space toggle"), helpStyle.Render("Enter apply · Esc cancel"))
 	width := max(1, min(54, m.width-4)-4)
 	for i, line := range lines {
 		lines[i] = truncateToWidth(line, width)

@@ -1066,6 +1066,20 @@ func readyToMerge(mr forge.Change) bool {
 	return mr.MergeState.Mergeable() && listMergeBlock(mr, forge.Vocabulary{}) == ""
 }
 
+// readyIncludingUpdate accepts an out-of-date branch if no other known list
+// fields indicate a blocker. An unknown merge state means no known blocker.
+func readyIncludingUpdate(mr forge.Change) bool {
+	if mr.MergedAt != "" || mr.Draft || mr.Conflicts || mr.ApprovalsLeft > 0 {
+		return false
+	}
+	switch mr.Pipeline {
+	case forge.StatusNone, forge.StatusSuccess, forge.StatusSkipped:
+	default:
+		return false
+	}
+	return mr.MergeState.Mergeable() || mr.MergeState == forge.MergeStateNeedsUpdate
+}
+
 func (m mrListModel) scopeSummaryDetail() string {
 	summary, ok := m.summaries[m.scope()]
 	if !ok {

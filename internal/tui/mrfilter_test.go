@@ -137,7 +137,7 @@ func TestAssignedFilterSkipsMergedControl(t *testing.T) {
 		t.Fatal("Assigned should not offer merged history")
 	}
 	m = filterKey(m, tea.KeyShiftTab)
-	if m.filterFocus != 4 {
+	if m.filterFocus != 5 {
 		t.Fatal("last Assigned control should be Reset")
 	}
 	m = filterText(m, " ")
@@ -286,13 +286,89 @@ func TestFilterModalFitsTerminal(t *testing.T) {
 		if lipgloss.Width(view) > m.width || lipgloss.Height(view) > m.height {
 			t.Fatalf("modal exceeds %dx%d: %dx%d", m.width, m.height, lipgloss.Width(view), lipgloss.Height(view))
 		}
-		for _, label := range []string{"Filters · Reviews", "Include drafts", "approved by me", "Include recently merged", "Include awaiting author", "Reset", "Enter apply", "Esc cancel"} {
+		for _, label := range []string{"Filters · Reviews", "Include drafts", "approved by me", "Include recently merged", "Include awaiting author", "Ready to merge", "Reset", "Enter apply", "Esc cancel"} {
 			if !strings.Contains(view, label) {
 				t.Fatalf("missing %q at %dx%d", label, m.width, m.height)
 			}
 		}
 		if m.width == 100 {
 			t.Log("\n" + view)
+		}
+	}
+}
+
+func TestReadyFilter(t *testing.T) {
+	cases := []struct {
+		name   string
+		change forge.Change
+		want   bool
+	}{
+		{"mergeable", forge.Change{MergeState: forge.MergeStateMergeable, Pipeline: forge.StatusSuccess}, true},
+		{"needs update", forge.Change{MergeState: forge.MergeStateNeedsUpdate, Pipeline: forge.StatusSuccess}, true},
+		{"unknown state", forge.Change{MergeState: forge.MergeStateUnknown}, true},
+		{"merged", forge.Change{MergedAt: "2026-11-05"}, false},
+		{"draft", forge.Change{MergeState: forge.MergeStateNeedsUpdate, Draft: true}, false},
+		{"conflict", forge.Change{MergeState: forge.MergeStateNeedsUpdate, Conflicts: true}, false},
+		{"missing approval", forge.Change{MergeState: forge.MergeStateNeedsUpdate, ApprovalsLeft: 1}, false},
+		{"running checks", forge.Change{MergeState: forge.MergeStateNeedsUpdate, Pipeline: forge.StatusRunning}, false},
+		{"failed checks", forge.Change{MergeState: forge.MergeStateNeedsUpdate, Pipeline: forge.StatusFailed}, false},
+		{"threads", forge.Change{MergeState: forge.MergeStateThreadsUnresolved}, false},
+		{"checking", forge.Change{MergeState: forge.MergeStateChecking}, false},
+		{"blocked", forge.Change{MergeState: forge.MergeStateBlocked}, false},
+	}
+	f := listFilter{readyOnly: true}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := f.matches(tc.change); got != tc.want {
+				t.Fatalf("matches = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	for tab := range scopeOrder {
+		m := filterModel()
+		m.scopeIdx = tab
+		m, _ = m.openFilters()
+		for i := 0; i < m.filterReadyIndex(); i++ {
+			m = filterKey(m, tea.KeyTab)
+		}
+		m = filterText(m, " ")
+		m = filterKey(m, tea.KeyEnter)
+		if !m.filters[tab].readyOnly || !strings.Contains(m.bottomLine(), "ready to merge") {
+			t.Fatalf("tab %d: readiness filter not applied", tab)
+		}
+	}
+}
+
+func TestReadyFilterExcludesIncompatibleInclusions(t *testing.T) {
+	for tab := range scopeOrder {
+		m := filterModel()
+		m.scopeIdx = tab
+		m, _ = m.openFilters()
+		m.filterFocus = m.filterReadyIndex()
+		m = filterText(m, " ")
+		if !m.filterDraft.readyOnly || !m.filterDraft.hideDrafts || (m.scopeHasMerged() && !m.filterDraft.hideMerged) {
+			t.Fatalf("tab %d: readiness must clear incompatible inclusions: %+v", tab, m.filterDraft)
+		}
+		if m.filterDraft.hideApprovedMe || m.filterDraft.hideAwaitingAuthor {
+			t.Fatal("readiness must retain compatible inclusions")
+		}
+		m.filterFocus = 1
+		m = filterText(m, " ")
+		if m.filterDraft.readyOnly || m.filterDraft.hideDrafts {
+			t.Fatal("including drafts must clear readiness")
+		}
+		if m.scopeHasMerged() {
+			m.filterFocus = m.filterReadyIndex()
+			m = filterText(m, " ")
+			m.filterFocus = 3
+			m = filterText(m, " ")
+			if m.filterDraft.readyOnly || m.filterDraft.hideMerged {
+				t.Fatal("including merged changes must clear readiness")
+			}
+		}
+		m = filterKey(m, tea.KeyEsc)
+		if m.filters[tab].active() {
+			t.Fatal("cancel must discard automatic checkbox changes")
 		}
 	}
 }
