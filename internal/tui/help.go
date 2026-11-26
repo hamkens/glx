@@ -136,6 +136,7 @@ func helpSections(v view, vocab forge.Vocabulary, caps forge.Capabilities) []hel
 				{"←/→ or tab", "switch scope"},
 				{"/", "open filters (text, drafts, approvals, merged, review, merge readiness)"},
 				{"esc", "clear filters in this tab"},
+				{"g", "group by repo / by status (whose move it is) in this tab"},
 				{"↑/↓", "move (auto-loads more)"},
 				{"pgup / pgdown", "half-page in Reviews / Authored"},
 			}},

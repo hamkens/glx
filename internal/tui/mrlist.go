@@ -34,6 +34,8 @@ type mrRow struct {
 	section   string // for isSection
 	project   string // for isHeader
 	host      string // for isHeader, when several hosts are connected
+	group     string
+	nested    bool
 	mr        forge.Change
 }
 
@@ -102,6 +104,7 @@ type mrListModel struct {
 	filterDraft listFilter
 	filterFocus int
 	scopeIdx    int
+	byStatus    [3]bool
 
 	mrs    []forge.Change // open changes, in server order
 	merged []forge.Change // recently-merged changes (Authored/Reviews only)
@@ -434,6 +437,10 @@ func containsAll(hay string, terms []string) bool {
 // the incoming order of first appearance decides group order, which keeps the
 // newest-updated-first merge from being reshuffled alphabetically.
 func (m *mrListModel) appendGrouped(mrs []forge.Change) {
+	m.appendRepoGroups(mrs, false)
+}
+
+func (m *mrListModel) appendRepoGroups(mrs []forge.Change, nested bool) {
 	type groupKey struct{ host, repo string }
 	var order []groupKey
 	groups := map[groupKey][]forge.Change{}
@@ -448,7 +455,7 @@ func (m *mrListModel) appendGrouped(mrs []forge.Change) {
 		if gi > 0 {
 			m.rows = append(m.rows, mrRow{isSpacer: true})
 		}
-		m.rows = append(m.rows, mrRow{isHeader: true, project: k.repo, host: k.host})
+		m.rows = append(m.rows, mrRow{isHeader: true, project: k.repo, host: k.host, nested: nested})
 		for _, mr := range groups[k] {
 			m.rows = append(m.rows, mrRow{mr: mr})
 		}
@@ -471,7 +478,11 @@ func (m *mrListModel) rebuildRows() {
 	if showSections {
 		m.rows = append(m.rows, mrRow{isSection: true, section: "Open"})
 	}
-	m.appendGrouped(open)
+	if m.byStatus[m.scopeIdx] {
+		m.appendStatusGrouped(open)
+	} else {
+		m.appendGrouped(open)
+	}
 
 	if showSections {
 		m.rows = append(m.rows, mrRow{isSpacer: true})
@@ -675,6 +686,9 @@ func (m mrListModel) handleKey(msg tea.KeyMsg) (mrListModel, tea.Cmd) {
 	case "esc":
 		m.filters[m.scopeIdx] = listFilter{}
 		m.rebuildRows()
+	case "g":
+		m.byStatus[m.scopeIdx] = !m.byStatus[m.scopeIdx]
+		m.rebuildRows()
 	case "down", "j":
 		m.moveCursor(1)
 	case "up", "k":
@@ -865,13 +879,19 @@ func (m mrListModel) renderRow(i int, activeProject string) string {
 		// Section banner ("Open" / "Merged · last 12h").
 		style := lipgloss.NewStyle().Bold(true).Underline(true).Foreground(lipgloss.Color("15"))
 		return truncateToWidth(style.Render(r.section), m.width)
+	case r.isHeader && r.group != "":
+		return truncateToWidth("  "+lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Render(r.group), m.width)
 	case r.isHeader:
 		// Project headers are indented under their section.
 		style := lipgloss.NewStyle().Bold(true).Foreground(colorSubtle)
 		if r.project == activeProject {
 			style = lipgloss.NewStyle().Bold(true).Foreground(colorAccent)
 		}
-		line := "  " + style.Render(r.project)
+		indent := "  "
+		if r.nested {
+			indent = "    "
+		}
+		line := indent + style.Render(r.project)
 		// On a merged list the host is what disambiguates one repo from another
 		// with the same path, so it rides along with the group header rather than
 		// costing every row a column.
@@ -1147,7 +1167,11 @@ func (m mrListModel) bottomLine() string {
 		return truncateToWidth(helpStyle.Render("  "+m.filterCount()+" · Filters: ")+
 			titleStyle.Render(f.summary())+helpStyle.Render(" · / edit · esc clear"), m.width)
 	}
-	return truncateToWidth(helpStyle.Render(fmt.Sprintf("  %s · enter open · a/M/A/b act · d diff · p %s · / filters · ? help", m.filterCount(), m.vocab.Pipeline)), m.width)
+	grouping := "by status"
+	if m.byStatus[m.scopeIdx] {
+		grouping = "by repo"
+	}
+	return truncateToWidth(helpStyle.Render(fmt.Sprintf("  %s · enter open · a/M/A/b act · d diff · p %s · / filters · g %s · ? help", m.filterCount(), m.vocab.Pipeline, grouping)), m.width)
 }
 
 func nowHM() string {
